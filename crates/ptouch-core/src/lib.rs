@@ -7,6 +7,9 @@
 //! printers over USB. It handles device discovery, protocol command
 //! construction, status parsing, and raster data transmission.
 
+mod model;
+mod session;
+
 pub mod device;
 pub mod error;
 pub mod protocol;

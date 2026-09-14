@@ -5,70 +5,78 @@
 // Portions derived from ptouch-print, licensed GPL-3.0-or-later:
 // https://git.familie-radermacher.ch/linux/ptouch-print.git
 
-//! USB transport layer for Brother P-Touch printers.
-//!
-//! Provides the [`PtouchDevice`] struct for opening, initializing, and
-//! communicating with a P-Touch printer over USB.
+//! USB discovery and backwards-compatible P-Touch device API.
 
-use std::time::{Duration, Instant};
-
+use crate::session::{PrinterSession, Transport};
+use crate::{
+    device::{self, BROTHER_VENDOR_ID, DeviceFlags, DeviceInfo},
+    error::{PtouchError, Result},
+    protocol,
+    status::PrinterStatus,
+};
 use log::{debug, info, warn};
 use rusb::{Context, DeviceHandle, UsbContext};
+use std::time::Duration;
 
-use crate::device::{self, BROTHER_VENDOR_ID, DeviceFlags, DeviceInfo};
-use crate::error::{PtouchError, Result};
-use crate::protocol;
-use crate::status::{PrinterStatus, STATUS_PACKET_SIZE};
-use crate::tape;
-
-/// Default USB timeout for bulk transfers.
-const USB_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Short timeout for flushing stale USB data.
-const USB_FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// Delay between status read retries.
-const STATUS_RETRY_DELAY: Duration = Duration::from_millis(100);
-
-/// Maximum number of status read retries.
-const STATUS_MAX_RETRIES: usize = 10;
-
-/// Maximum time to wait without hearing anything from the printer after a
-/// print command. The deadline restarts on every status transfer, so a label
-/// that takes minutes to feed is bounded by printer silence, not by the total
-/// length of the job.
-const PRINT_STATUS_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Bound each USB read so transient silence cannot consume the whole idle
-/// deadline in a single transfer.
-const PRINT_STATUS_POLL_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Never hand libusb a zero timeout, which means "wait forever".
-const PRINT_STATUS_MIN_POLL_TIMEOUT: Duration = Duration::from_millis(1);
-
-/// Pace the loop after a zero-length bulk transfer so a printer that keeps
-/// completing empty reads cannot spin a core until the deadline expires.
-const ZERO_LENGTH_TRANSFER_DELAY: Duration = Duration::from_millis(10);
-
-/// USB interface number for P-Touch printers.
 const USB_INTERFACE: u8 = 0;
 
-/// A connection to a Brother P-Touch USB printer.
-pub struct PtouchDevice {
-    /// USB device handle.
+struct UsbTransport {
     handle: DeviceHandle<Context>,
-    /// Device information from the supported device table.
-    dev_info: DeviceInfo,
-    /// Bulk OUT endpoint address.
     ep_out: u8,
-    /// Bulk IN endpoint address.
     ep_in: u8,
-    /// Most recently read printer status.
-    status: Option<PrinterStatus>,
-    /// Tape width in pixels (resolved after status query).
-    tape_width_px: Option<u16>,
-    /// Whether the device has been initialized.
-    initialized: bool,
+}
+
+impl Transport for UsbTransport {
+    fn send(&self, data: &[u8], timeout: Duration) -> Result<()> {
+        let written = self
+            .handle
+            .write_bulk(self.ep_out, data, timeout)
+            .map_err(|e| {
+                if e == rusb::Error::Timeout {
+                    PtouchError::Timeout
+                } else {
+                    PtouchError::UsbError(e)
+                }
+            })?;
+
+        if written != data.len() {
+            return Err(PtouchError::SendFailed(format!(
+                "Expected to write {} bytes, wrote {}",
+                data.len(),
+                written
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn receive(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        let read = self
+            .handle
+            .read_bulk(self.ep_in, buf, timeout)
+            .map_err(|e| {
+                if e == rusb::Error::Timeout {
+                    PtouchError::Timeout
+                } else {
+                    PtouchError::UsbError(e)
+                }
+            })?;
+
+        Ok(read)
+    }
+
+    fn close(self) -> Result<()> {
+        self.handle.release_interface(USB_INTERFACE)?;
+        Ok(())
+    }
+}
+
+/// A connection to a Brother P-Touch USB printer.
+///
+/// This facade keeps the USB constructors and method signatures unchanged.
+pub struct PtouchDevice {
+    session: PrinterSession<UsbTransport>,
+    dev_info: DeviceInfo,
 }
 
 impl PtouchDevice {
@@ -123,13 +131,15 @@ impl PtouchDevice {
         debug!("Endpoints: OUT={:#04x}, IN={:#04x}", ep_out, ep_in);
 
         Ok(PtouchDevice {
-            handle,
+            session: PrinterSession::new(
+                UsbTransport {
+                    handle,
+                    ep_out,
+                    ep_in,
+                },
+                (&dev_info).into(),
+            ),
             dev_info,
-            ep_out,
-            ep_in,
-            status: None,
-            tape_width_px: None,
-            initialized: false,
         })
     }
 
@@ -165,251 +175,51 @@ impl PtouchDevice {
         Err(PtouchError::DeviceNotFound)
     }
 
-    /// Get a reference to the device info.
+    /// Get a reference to the USB device info.
     pub fn device_info(&self) -> &DeviceInfo {
         &self.dev_info
     }
-
     /// Get the device flags.
     pub fn flags(&self) -> DeviceFlags {
-        self.dev_info.flags
+        self.session.flags()
     }
-
-    /// Get the most recently read printer status, if available.
+    /// Get the most recently read printer status.
     pub fn status(&self) -> Option<&PrinterStatus> {
-        self.status.as_ref()
+        self.session.status()
     }
-
     /// Get the tape width in pixels, if known.
     pub fn tape_width_px(&self) -> Option<u16> {
-        self.tape_width_px
+        self.session.tape_width_px()
     }
-
     /// Get the maximum printable pixels for this device.
     pub fn max_px(&self) -> u16 {
-        self.dev_info.max_px
+        self.session.max_px()
     }
-
-    /// Whether the device has been initialized.
+    /// Whether the printer has been initialized.
     pub fn is_initialized(&self) -> bool {
-        self.initialized
+        self.session.is_initialized()
     }
-
-    /// Send raw bytes to the printer (bulk OUT transfer).
+    /// Send raw bytes through the USB OUT endpoint.
     pub fn send(&self, data: &[u8]) -> Result<()> {
-        let written = self
-            .handle
-            .write_bulk(self.ep_out, data, USB_TIMEOUT)
-            .map_err(|e| {
-                if e == rusb::Error::Timeout {
-                    PtouchError::Timeout
-                } else {
-                    PtouchError::UsbError(e)
-                }
-            })?;
-
-        if written != data.len() {
-            return Err(PtouchError::SendFailed(format!(
-                "Expected to write {} bytes, wrote {}",
-                data.len(),
-                written
-            )));
-        }
-
-        Ok(())
+        self.session.send(data)
     }
-
-    /// Receive raw bytes from the printer (bulk IN transfer).
-    ///
-    /// Returns the number of bytes actually read into `buf`.
+    /// Receive raw bytes from the USB IN endpoint.
     pub fn receive(&self, buf: &mut [u8]) -> Result<usize> {
-        self.receive_with_timeout(buf, USB_TIMEOUT)
+        self.session.receive(buf)
     }
-
-    /// Receive raw bytes with a caller-provided timeout.
-    fn receive_with_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
-        let read = self
-            .handle
-            .read_bulk(self.ep_in, buf, timeout)
-            .map_err(|e| {
-                if e == rusb::Error::Timeout {
-                    PtouchError::Timeout
-                } else {
-                    PtouchError::UsbError(e)
-                }
-            })?;
-
-        Ok(read)
-    }
-
-    /// Flush stale data from the USB IN endpoint.
-    ///
-    /// Performs short-timeout reads and discards any data until the pipe
-    /// is empty. This prevents stale responses from confusing subsequent
-    /// command/response exchanges.
-    fn flush_input(&self) {
-        let mut buf = [0u8; 64];
-        loop {
-            match self
-                .handle
-                .read_bulk(self.ep_in, &mut buf, USB_FLUSH_TIMEOUT)
-            {
-                Ok(n) if n > 0 => {
-                    debug!("Flushed {} stale bytes from USB IN", n);
-                }
-                _ => break,
-            }
-        }
-    }
-
-    /// Initialize the printer.
-    ///
-    /// Sends the init sequence (100 zeros + ESC @) and queries the status.
-    /// Raster start is sent per-job in `print_raster()`.
+    /// Initialize the printer and query status.
     pub fn init(&mut self) -> Result<()> {
-        // Flush any stale data from previous sessions
-        self.flush_input();
-
-        // Send the init command (100 zeros + ESC @)
-        self.send(&protocol::cmd_init())?;
-
-        // Request and read status
-        self.get_status()?;
-
-        if self
-            .dev_info
-            .flags
-            .contains(DeviceFlags::AUTO_STATUS_NOTIFICATION)
-        {
-            // Enable the phase changes used by the post-print readiness handshake.
-            self.send(&protocol::cmd_auto_status_notification(true))?;
-        }
-
-        self.initialized = true;
-        info!(
-            "Device initialized: {}, tape={}mm ({}px)",
-            self.dev_info.name,
-            self.status.as_ref().map_or(0, |s| s.media_width),
-            self.tape_width_px.unwrap_or(0)
-        );
-
-        Ok(())
+        self.session.init()
     }
-
-    /// Query printer status without sending the init command.
-    ///
-    /// Flushes stale USB data and reads the printer status. Unlike
-    /// [`init`](Self::init), this does not send the 100-zero + ESC @
-    /// reset sequence, so it will not disturb the printer.
+    /// Query status without resetting the printer.
     pub fn query_status(&mut self) -> Result<&PrinterStatus> {
-        self.flush_input();
-        self.get_status()
+        self.session.query_status()
     }
-
     /// Request and read the printer status.
-    ///
-    /// Sends the status request command and reads the 32-byte response.
-    /// Retries up to STATUS_MAX_RETRIES times with STATUS_RETRY_DELAY
-    /// between attempts.
-    /// Updates internal status and tape width fields.
     pub fn get_status(&mut self) -> Result<&PrinterStatus> {
-        self.send(&protocol::cmd_status_request())?;
-
-        let mut buf = [0u8; STATUS_PACKET_SIZE];
-        let mut frames = StatusFrameBuffer::new();
-        let mut response = None;
-
-        // Retry loop: sleep then read
-        for attempt in 0..STATUS_MAX_RETRIES {
-            std::thread::sleep(STATUS_RETRY_DELAY);
-
-            match self.handle.read_bulk(self.ep_in, &mut buf, USB_TIMEOUT) {
-                Ok(0) => {
-                    debug!("Empty status read (attempt {})", attempt + 1);
-                    continue;
-                }
-                Ok(n) => {
-                    frames.push(&buf[..n]);
-                    response = frames.pop();
-                }
-                Err(rusb::Error::Timeout) => {
-                    debug!("Status read timeout (attempt {})", attempt + 1);
-                    continue;
-                }
-                Err(e) => return Err(PtouchError::UsbError(e)),
-            }
-
-            if response.is_some() {
-                break;
-            }
-            debug!(
-                "Short status read ({} bytes, attempt {})",
-                frames.len(),
-                attempt + 1
-            );
-        }
-
-        let Some(response) = response else {
-            // Flush junk data before returning error
-            self.flush_input();
-            return Err(PtouchError::StatusError(format!(
-                "Status packet too short: {} bytes (expected {})",
-                frames.len(),
-                STATUS_PACKET_SIZE
-            )));
-        };
-
-        let status = match parse_status_packet(&response, "Invalid status header") {
-            Ok(status) => status,
-            Err(error) => {
-                self.flush_input();
-                return Err(error);
-            }
-        };
-
-        debug!(
-            "Status: type={}, media_width={}mm, media_type={}, tape_color={}, text_color={}",
-            status.status_type_name(),
-            status.media_width,
-            status.media_type_name(),
-            status.tape_color_name(),
-            status.text_color_name()
-        );
-
-        if status.has_error() {
-            warn!("Printer reports error: {}", status.error_description());
-        }
-
-        // Resolve tape width to pixel count for this printer's resolution,
-        // clamped to the head width (wide tapes exceed narrow heads).
-        self.tape_width_px = tape::tape_pixels(status.media_width, self.dev_info.dpi)
-            .map(|px| px.min(self.dev_info.max_px));
-        if self.tape_width_px.is_none() && status.media_width != 0 {
-            warn!("Unknown tape width: {} mm", status.media_width);
-        }
-
-        self.status = Some(status);
-
-        // The unwrap is safe because we just assigned Some above
-        Ok(self.status.as_ref().unwrap())
+        self.session.get_status()
     }
-
-    /// Print raster image data.
-    ///
-    /// `lines` is a slice of raster line buffers, each `ceil(max_px/8)` bytes
-    /// wide. The printer will print one raster line per entry.
-    ///
-    /// # Arguments
-    /// * `lines` - Raster image data, one byte-slice per line.
-    /// * `chain_print` - If true, don't cut the tape (chain mode).
-    /// * `precut` - If true AND device supports precut, send precut command.
-    /// * `quality` - Print quality mode (device must support non-standard).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PtouchError::NotInitialized`] if [`init`](Self::init) was
-    /// not called, or [`PtouchError::UnsupportedQuality`] if a non-standard
-    /// quality is requested on a device without quality modes.
+    /// Print raster lines with the existing USB job options.
     pub fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
@@ -417,279 +227,17 @@ impl PtouchDevice {
         precut: bool,
         quality: protocol::PrintQuality,
     ) -> Result<()> {
-        if !self.initialized {
-            return Err(PtouchError::NotInitialized);
-        }
-
-        if quality != protocol::PrintQuality::Standard
-            && !self.dev_info.flags.contains(DeviceFlags::LEGACY_HIRES)
-        {
-            return Err(PtouchError::UnsupportedQuality(
-                self.dev_info.name.to_string(),
-            ));
-        }
-
-        let opts = protocol::JobOptions {
-            media_width: self.status.as_ref().map_or(0, |s| s.media_width),
-            chain_print,
-            precut,
-            quality,
-        };
-
-        let job = protocol::build_print_job(lines, self.dev_info.flags, &opts);
-        self.send_job(job)?;
-
-        if self
-            .dev_info
-            .flags
-            .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
-        {
-            self.wait_until_ready()
-        } else {
-            self.receive_print_completion()
-        }
+        self.session
+            .print_raster(lines, chain_print, precut, quality)
     }
-
     /// Feed tape forward and cut.
-    ///
-    /// Prints a minimal blank strip (a few blank raster lines) then
-    /// ejects and cuts. The printer needs actual raster data to engage
-    /// the feed mechanism.
     pub fn feed_and_cut(&mut self) -> Result<()> {
-        if !self.initialized {
-            return Err(PtouchError::NotInitialized);
-        }
-
-        // One blank line makes the printer engage the feed mechanism.
-        let lines = vec![protocol::rasterline_blank(self.dev_info.max_px)];
-        let opts = protocol::JobOptions {
-            media_width: self.status.as_ref().map_or(0, |s| s.media_width),
-            ..protocol::JobOptions::default()
-        };
-
-        let job = protocol::build_print_job(&lines, self.dev_info.flags, &opts);
-        self.send_job(job)?;
-
-        if self
-            .dev_info
-            .flags
-            .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
-        {
-            self.wait_until_ready()?;
-        }
-
-        info!("Feed and cut");
-        Ok(())
+        self.session.feed_and_cut()
     }
-
-    fn send_job(&self, job: Vec<Vec<u8>>) -> Result<()> {
-        for chunk in job {
-            self.send(&chunk)?;
-        }
-
-        Ok(())
-    }
-
-    fn wait_until_ready(&mut self) -> Result<()> {
-        match receive_print_status(|buf, timeout| self.receive_with_timeout(buf, timeout)) {
-            Ok(status) => {
-                self.status = Some(status);
-                Ok(())
-            }
-            // The printer stopped talking without announcing the receiving
-            // phase. The page itself has most likely printed, so fall back to
-            // the best-effort contract instead of failing a finished job.
-            Err(PtouchError::Timeout) => {
-                warn!("Printer did not report the receiving phase, continuing anyway");
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Preserve the original best-effort completion read for models whose
-    /// readiness lifecycle has not been documented or tested.
-    fn receive_print_completion(&mut self) -> Result<()> {
-        let mut response = [0u8; STATUS_PACKET_SIZE];
-        match self.receive(&mut response) {
-            Ok(n) if n >= STATUS_PACKET_SIZE => {
-                if let Some(status) = PrinterStatus::from_bytes(&response) {
-                    if status.has_error() {
-                        return Err(PtouchError::StatusError(status.error_description()));
-                    }
-                    debug!("Print completed: status_type={}", status.status_type_name());
-                    self.status = Some(status);
-                }
-            }
-            Ok(n) => {
-                debug!("Short status response after print: {} bytes", n);
-            }
-            Err(PtouchError::Timeout) => {
-                debug!("Timeout waiting for print completion status");
-            }
-            Err(error) => return Err(error),
-        }
-
-        Ok(())
-    }
-
     /// Release the USB interface and close the device.
     pub fn close(self) -> Result<()> {
-        self.handle.release_interface(USB_INTERFACE)?;
-        info!("Device closed: {}", self.dev_info.name);
-        Ok(())
+        self.session.close()
     }
-}
-
-/// Receive the printer's automatic status after a print command.
-fn receive_print_status<F>(mut receive: F) -> Result<PrinterStatus>
-where
-    F: FnMut(&mut [u8], Duration) -> Result<usize>,
-{
-    receive_print_status_with_timeout(&mut receive, PRINT_STATUS_IDLE_TIMEOUT)
-}
-
-fn receive_print_status_with_timeout<F>(
-    mut receive: F,
-    idle_timeout: Duration,
-) -> Result<PrinterStatus>
-where
-    F: FnMut(&mut [u8], Duration) -> Result<usize>,
-{
-    let mut last_transfer = Instant::now();
-    let mut frames = StatusFrameBuffer::new();
-
-    loop {
-        let Some(remaining) = idle_timeout.checked_sub(last_transfer.elapsed()) else {
-            return Err(PtouchError::Timeout);
-        };
-
-        let mut transfer = [0u8; STATUS_PACKET_SIZE];
-        let read_timeout = remaining
-            .min(PRINT_STATUS_POLL_TIMEOUT)
-            .max(PRINT_STATUS_MIN_POLL_TIMEOUT);
-        let read = match receive(&mut transfer, read_timeout) {
-            Ok(read) => read,
-            Err(PtouchError::Timeout) => {
-                debug!("No print status available yet");
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-
-        if read > transfer.len() {
-            return Err(PtouchError::StatusError(format!(
-                "USB read reported {} bytes for a {}-byte buffer",
-                read,
-                transfer.len()
-            )));
-        }
-
-        // A successful zero-byte bulk transfer is USB framing, not a Brother
-        // status packet. Keep waiting within the overall deadline.
-        if read == 0 {
-            debug!("Ignoring zero-length USB transfer after print");
-            std::thread::sleep(ZERO_LENGTH_TRANSFER_DELAY);
-            continue;
-        }
-
-        // Real bytes mean the job is still alive. Restart the idle deadline so
-        // a label that feeds for a long time is not cut short mid-print.
-        last_transfer = Instant::now();
-
-        frames.push(&transfer[..read]);
-        if frames.len() < STATUS_PACKET_SIZE {
-            debug!(
-                "Accumulated {} of {} print-status bytes",
-                frames.len(),
-                STATUS_PACKET_SIZE
-            );
-            continue;
-        }
-
-        let Some(response) = frames.pop() else {
-            continue;
-        };
-        let status = parse_status_packet(&response, "Invalid status header after print")?;
-
-        debug!(
-            "Print status: type={}, phase_type={:#04x}, phase={:#04x}{:02x}",
-            status.status_type_name(),
-            status.phase_type,
-            status.phase_number_hi,
-            status.phase_number_lo
-        );
-
-        if print_status_is_ready(&status)? {
-            debug!("Printer is ready to receive the next page");
-            return Ok(status);
-        }
-    }
-}
-
-struct StatusFrameBuffer {
-    pending: Vec<u8>,
-}
-
-impl StatusFrameBuffer {
-    fn new() -> Self {
-        Self {
-            pending: Vec::with_capacity(STATUS_PACKET_SIZE * 2),
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
-    }
-
-    fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    fn pop(&mut self) -> Option<[u8; STATUS_PACKET_SIZE]> {
-        if self.pending.len() < STATUS_PACKET_SIZE {
-            return None;
-        }
-
-        let mut frame = [0u8; STATUS_PACKET_SIZE];
-        frame.copy_from_slice(&self.pending[..STATUS_PACKET_SIZE]);
-        self.pending.drain(..STATUS_PACKET_SIZE);
-        Some(frame)
-    }
-}
-
-fn parse_status_packet(
-    response: &[u8; STATUS_PACKET_SIZE],
-    invalid_header_message: &str,
-) -> Result<PrinterStatus> {
-    let status = PrinterStatus::from_bytes(response)
-        .ok_or_else(|| PtouchError::StatusError("Failed to parse status packet".to_string()))?;
-
-    if status.print_head_mark != 0x80 || status.size != 0x20 {
-        return Err(PtouchError::StatusError(format!(
-            "{}: mark={:#04x} size={:#04x}",
-            invalid_header_message, status.print_head_mark, status.size
-        )));
-    }
-
-    Ok(status)
-}
-
-fn print_status_is_ready(status: &PrinterStatus) -> Result<bool> {
-    if status.has_error() || status.status_type == 0x02 {
-        let description = if status.has_error() {
-            status.error_description()
-        } else {
-            "Printer reported an unspecified error".to_string()
-        };
-        return Err(PtouchError::StatusError(description));
-    }
-
-    if status.status_type == 0x04 {
-        return Err(PtouchError::StatusError("Printer turned off".to_string()));
-    }
-
-    Ok(status.is_waiting_to_receive())
 }
 
 /// Find the bulk IN and OUT endpoints for the printer interface.
@@ -729,255 +277,10 @@ fn find_bulk_endpoints(handle: &DeviceHandle<Context>) -> Result<(u8, u8)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-
     use super::*;
-
-    fn status_packet(status_type: u8, phase_type: u8) -> [u8; STATUS_PACKET_SIZE] {
-        let mut packet = [0u8; STATUS_PACKET_SIZE];
-        packet[0] = 0x80;
-        packet[1] = 0x20;
-        packet[18] = status_type;
-        packet[19] = phase_type;
-        packet
-    }
-
     #[test]
-    fn print_status_waits_until_reception_is_possible() {
-        let mut packets = VecDeque::from([
-            status_packet(0x06, 0x01),
-            status_packet(0x01, 0x00),
-            status_packet(0x06, 0x00),
-        ]);
-
-        let status = receive_print_status(|buf, _timeout| {
-            let packet = packets.pop_front().ok_or(PtouchError::Timeout)?;
-            buf.copy_from_slice(&packet);
-            Ok(packet.len())
-        })
-        .unwrap();
-
-        assert_eq!(status.status_type, 0x06);
-        assert_eq!(status.phase_type, 0x00);
-        assert!(packets.is_empty());
-    }
-
-    #[test]
-    fn print_status_does_not_accept_printing_completed_as_ready() {
-        let mut packets = VecDeque::from([status_packet(0x01, 0x00)]);
-
-        let result = receive_print_status_with_timeout(
-            |buf, _timeout| {
-                let packet = packets.pop_front().ok_or(PtouchError::Timeout)?;
-                buf.copy_from_slice(&packet);
-                Ok(packet.len())
-            },
-            Duration::from_millis(1),
-        );
-
-        assert!(matches!(result, Err(PtouchError::Timeout)));
-    }
-
-    #[test]
-    fn print_status_propagates_printer_errors() {
-        let mut packet = status_packet(0x02, 0x00);
-        packet[8] = 0x04;
-
-        let result = receive_print_status(|buf, _timeout| {
-            buf.copy_from_slice(&packet);
-            Ok(packet.len())
-        });
-
-        assert!(matches!(
-            result,
-            Err(PtouchError::StatusError(message)) if message == "Cutter jam"
-        ));
-    }
-
-    #[test]
-    fn print_status_propagates_power_off() {
-        let packet = status_packet(0x04, 0x00);
-
-        let result = receive_print_status(|buf, _timeout| {
-            buf.copy_from_slice(&packet);
-            Ok(packet.len())
-        });
-
-        assert!(matches!(
-            result,
-            Err(PtouchError::StatusError(message)) if message == "Printer turned off"
-        ));
-    }
-
-    #[test]
-    fn print_status_times_out_after_incomplete_packet() {
-        let mut transfers = VecDeque::from([Ok(vec![0u8; 12]), Err(PtouchError::Timeout)]);
-
-        let result = receive_print_status_with_timeout(
-            |buf, _timeout| match transfers.pop_front().unwrap_or(Err(PtouchError::Timeout)) {
-                Ok(transfer) => {
-                    buf[..transfer.len()].copy_from_slice(&transfer);
-                    Ok(transfer.len())
-                }
-                Err(error) => Err(error),
-            },
-            Duration::from_millis(1),
-        );
-
-        assert!(matches!(result, Err(PtouchError::Timeout)));
-    }
-
-    #[test]
-    fn print_status_ignores_zero_length_usb_transfers() {
-        let mut transfers = VecDeque::from([
-            Vec::new(),
-            status_packet(0x06, 0x01).to_vec(),
-            status_packet(0x01, 0x00).to_vec(),
-            status_packet(0x06, 0x00).to_vec(),
-        ]);
-
-        let status = receive_print_status(|buf, _timeout| {
-            let transfer = transfers.pop_front().ok_or(PtouchError::Timeout)?;
-            buf[..transfer.len()].copy_from_slice(&transfer);
-            Ok(transfer.len())
-        })
-        .unwrap();
-
-        assert!(status.is_waiting_to_receive());
-        assert!(transfers.is_empty());
-    }
-
-    #[test]
-    fn print_status_accumulates_fragmented_packets() {
-        let ready = status_packet(0x06, 0x00);
-        let mut transfers = VecDeque::from([ready[..11].to_vec(), ready[11..].to_vec()]);
-
-        let status = receive_print_status(|buf, _timeout| {
-            let transfer = transfers.pop_front().ok_or(PtouchError::Timeout)?;
-            buf[..transfer.len()].copy_from_slice(&transfer);
-            Ok(transfer.len())
-        })
-        .unwrap();
-
-        assert!(status.is_waiting_to_receive());
-        assert!(transfers.is_empty());
-    }
-
-    #[test]
-    fn status_frame_buffer_preserves_partial_next_packet() {
-        let first = status_packet(0x01, 0x00);
-        let second = status_packet(0x06, 0x00);
-        let mut frames = StatusFrameBuffer::new();
-
-        frames.push(&first[..9]);
-        frames.push(&[first[9..].as_ref(), second[..7].as_ref()].concat());
-
-        assert_eq!(frames.pop(), Some(first));
-        assert_eq!(frames.len(), 7);
-
-        frames.push(&second[7..]);
-        assert_eq!(frames.pop(), Some(second));
-        assert_eq!(frames.len(), 0);
-    }
-
-    #[test]
-    fn print_status_tolerates_transient_usb_timeouts() {
-        let ready = status_packet(0x06, 0x00);
-        let mut transfers = VecDeque::from([
-            Err(PtouchError::Timeout),
-            Err(PtouchError::Timeout),
-            Ok(ready.to_vec()),
-        ]);
-
-        let status = receive_print_status(|buf, _timeout| {
-            match transfers.pop_front().ok_or(PtouchError::Timeout)? {
-                Ok(transfer) => {
-                    buf[..transfer.len()].copy_from_slice(&transfer);
-                    Ok(transfer.len())
-                }
-                Err(error) => Err(error),
-            }
-        })
-        .unwrap();
-
-        assert!(status.is_waiting_to_receive());
-        assert!(transfers.is_empty());
-    }
-
-    #[test]
-    fn consecutive_pages_each_wait_for_their_receiving_phase() {
-        let mut transfers = VecDeque::from([
-            status_packet(0x06, 0x01),
-            status_packet(0x01, 0x00),
-            status_packet(0x06, 0x00),
-            status_packet(0x06, 0x01),
-            status_packet(0x01, 0x00),
-            status_packet(0x06, 0x00),
-        ]);
-        let mut receive = |buf: &mut [u8], _timeout: Duration| {
-            let packet = transfers.pop_front().ok_or(PtouchError::Timeout)?;
-            buf.copy_from_slice(&packet);
-            Ok(packet.len())
-        };
-
-        let first = receive_print_status(&mut receive).unwrap();
-        let second = receive_print_status(&mut receive).unwrap();
-
-        assert!(first.is_waiting_to_receive());
-        assert!(second.is_waiting_to_receive());
-        assert!(transfers.is_empty());
-    }
-
-    #[test]
-    fn print_status_has_an_overall_deadline() {
-        let result = receive_print_status_with_timeout(|_, _| Ok(0), Duration::ZERO);
-
-        assert!(matches!(result, Err(PtouchError::Timeout)));
-    }
-
-    #[test]
-    fn print_status_deadline_restarts_on_every_transfer() {
-        let mut packets = VecDeque::from([
-            status_packet(0x06, 0x01),
-            status_packet(0x06, 0x01),
-            status_packet(0x01, 0x00),
-            status_packet(0x06, 0x00),
-        ]);
-
-        // Every gap stays inside the idle deadline while the total elapsed
-        // time runs past it, which is what a long label looks like.
-        let status = receive_print_status_with_timeout(
-            |buf, _timeout| {
-                std::thread::sleep(Duration::from_millis(100));
-                let packet = packets.pop_front().ok_or(PtouchError::Timeout)?;
-                buf.copy_from_slice(&packet);
-                Ok(packet.len())
-            },
-            Duration::from_millis(300),
-        )
-        .unwrap();
-
-        assert!(status.is_waiting_to_receive());
-        assert!(packets.is_empty());
-    }
-
-    #[test]
-    fn print_status_paces_zero_length_transfers() {
-        let mut transfers = 0usize;
-
-        let result = receive_print_status_with_timeout(
-            |_, _| {
-                transfers += 1;
-                Ok(0)
-            },
-            Duration::from_millis(50),
-        );
-
-        assert!(matches!(result, Err(PtouchError::Timeout)));
-        assert!(
-            transfers <= 50,
-            "zero-length transfers were not paced ({} reads)",
-            transfers
-        );
+    fn usb_facade_preserves_send_and_sync() {
+        fn assert_traits<T: Send + Sync>() {}
+        assert_traits::<PtouchDevice>();
     }
 }
