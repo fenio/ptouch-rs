@@ -193,7 +193,7 @@ impl PtouchDevice {
     }
     /// Get the maximum printable pixels for this device.
     pub fn max_px(&self) -> u16 {
-        self.session.max_px()
+        self.session.raster_width_px()
     }
     /// Whether the printer has been initialized.
     pub fn is_initialized(&self) -> bool {

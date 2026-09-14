@@ -53,3 +53,8 @@ jobs:
 
     - name: Run tests
       run: cargo test --workspace --verbose --target ${{ matrix.target }}
+
+    - name: Test optional Bluetooth feature
+      run: |
+        cargo test -p ptouch-core --features bluetooth --all-targets --locked --target ${{ matrix.target }}
+        cargo test -p ptouch-core --features bluetooth --doc --locked --target ${{ matrix.target }}

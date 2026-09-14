@@ -15,6 +15,14 @@ pub enum PtouchError {
     #[error("USB error: {0}")]
     UsbError(#[from] rusb::Error),
 
+    /// Native Bluetooth communication or setup error.
+    #[error("Bluetooth error: {0}")]
+    Bluetooth(String),
+
+    /// A model does not support the requested operation.
+    #[error("Unsupported operation: {0}")]
+    UnsupportedOperation(&'static str),
+
     /// No matching device was found on the USB bus.
     #[error("Device not found")]
     DeviceNotFound,
@@ -35,8 +43,8 @@ pub enum PtouchError {
     #[error("Status error: {0}")]
     StatusError(String),
 
-    /// A USB transfer timed out.
-    #[error("USB transfer timed out")]
+    /// A printer transfer or status deadline expired.
+    #[error("Printer communication timed out")]
     Timeout,
 
     /// The image height exceeds the maximum for the current tape.

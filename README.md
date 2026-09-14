@@ -1,6 +1,7 @@
 # ptouch-rs
 
 Rust tool for Brother P-Touch USB label printers. CLI and GUI.
+Optional native macOS Bluetooth support is available in `ptouch-core` for the PT-P300BT.
 
 ![ptouch-gui screenshot](https://github.com/user-attachments/assets/b18ba04d-0526-43f8-ad40-8ca29b5cb280)
 
@@ -50,6 +51,40 @@ Binaries: `target/release/ptouch` (CLI), `target/release/ptouch-gui` (GUI).
 
 libusb is compiled in statically (`rusb` vendored), so the binaries carry no
 external libusb dependency.
+
+## PT-P300BT Bluetooth (macOS)
+
+The optional `ptouch-core` `bluetooth` feature adds a native RFCOMM backend and
+an example entry point. Pair the printer in macOS Bluetooth settings and grant
+Bluetooth access to the terminal/application. The existing CLI and GUI currently
+continue to select USB printers.
+
+```sh
+CARGO_HOME=/tmp/ptouch-bt-cargo cargo run -p ptouch-core --features bluetooth --example bluetooth -- status AA:BB:CC:DD:EE:FF 3
+CARGO_HOME=/tmp/ptouch-bt-cargo cargo run -p ptouch-core --features bluetooth --example bluetooth -- print AA:BB:CC:DD:EE:FF
+```
+
+Replace the address with your paired printer's address. `status` repeats three
+connection/query/close sessions; `print` sends one fixed RUST label. Cargo
+artifacts stay in the checkout and dependencies in the specified temporary
+cache. No Python packages or Bluetooth serial device nodes are required.
+
+The first profile supports the physically verified 12mm tape, with 64 printable
+dots centered in 128-dot raster transfer lines at 180 dpi. Other widths and marks
+outside that area are rejected. Printing waits for the printer's completion
+notification, checks errors, and never automatically retries a failed job.
+The PT-P300BT has a manual cutter.
+
+Library users can open `ptouch_core::BluetoothDevice`, call `init`, prepare
+16-byte raster lines using bottom-to-top dot order, then call `print_raster` and
+`close`. Native objects stay on the main thread and cannot be sent or shared
+across threads. These synchronous session calls are suitable for the example;
+the GUI needs a separate event-driven service before Bluetooth selection is
+added. Close assumes exclusive ownership and also disconnects the printer's
+baseband connection. Apple's baseband close is synchronous. If an async write
+never completes, one transfer buffer is conservatively retained to avoid freeing
+memory still potentially used by Bluetooth; this only occurs on a failed
+connection, which is then closed.
 
 ## Prebuilt Packages
 

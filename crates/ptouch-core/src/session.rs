@@ -7,13 +7,13 @@
 
 //! Transport-independent printer state and command lifecycle.
 
-use crate::model::ModelProfile;
+use crate::model::{Dialect, ModelProfile};
+use crate::p300bt;
 use crate::{
     device::DeviceFlags,
     error::{PtouchError, Result},
     protocol,
     status::{PrinterStatus, STATUS_PACKET_SIZE},
-    tape,
 };
 use log::{debug, info, warn};
 use std::time::{Duration, Instant};
@@ -25,11 +25,11 @@ pub(crate) trait Transport {
     fn close(self) -> Result<()>;
 }
 
-/// Default USB timeout for bulk transfers.
-const USB_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default timeout for byte transfers.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Short timeout for flushing stale USB data.
-const USB_FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
+/// Short timeout for flushing stale input.
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Delay between status read retries.
 const STATUS_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -87,9 +87,9 @@ impl<T: Transport> PrinterSession<T> {
         self.tape_width_px
     }
 
-    /// Get the maximum printable pixels for this device.
-    pub fn max_px(&self) -> u16 {
-        self.profile.max_px
+    /// Get the raster transfer width, which may exceed the printable area.
+    pub fn raster_width_px(&self) -> u16 {
+        self.profile.raster_width_px
     }
 
     /// Whether the device has been initialized.
@@ -99,11 +99,11 @@ impl<T: Transport> PrinterSession<T> {
 
     /// Send raw bytes through the selected transport.
     pub fn send(&self, data: &[u8]) -> Result<()> {
-        self.transport.send(data, USB_TIMEOUT)
+        self.transport.send(data, TRANSFER_TIMEOUT)
     }
 
     pub fn receive(&self, buf: &mut [u8]) -> Result<usize> {
-        self.receive_with_timeout(buf, USB_TIMEOUT)
+        self.receive_with_timeout(buf, TRANSFER_TIMEOUT)
     }
 
     fn receive_with_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
@@ -112,11 +112,19 @@ impl<T: Transport> PrinterSession<T> {
 
     fn flush_input(&self) {
         let mut buf = [0u8; 64];
-        while let Ok(n) = self.transport.receive(&mut buf, USB_FLUSH_TIMEOUT) {
-            if n == 0 {
-                break;
+        let start = Instant::now();
+        loop {
+            let timeout = match self.profile.dialect {
+                Dialect::Usb => FLUSH_TIMEOUT,
+                Dialect::P300Bt => match FLUSH_TIMEOUT.checked_sub(start.elapsed()) {
+                    Some(remaining) if !remaining.is_zero() => remaining,
+                    _ => break,
+                },
+            };
+            match self.transport.receive(&mut buf, timeout) {
+                Ok(n) if n > 0 => debug!("Flushed {} stale bytes", n),
+                _ => break,
             }
-            debug!("Flushed {} stale bytes", n);
         }
     }
 
@@ -129,7 +137,10 @@ impl<T: Transport> PrinterSession<T> {
         self.flush_input();
 
         // Send the init command (100 zeros + ESC @)
-        self.send(&protocol::cmd_init())?;
+        match self.profile.dialect {
+            Dialect::Usb => self.send(&protocol::cmd_init())?,
+            Dialect::P300Bt => self.send(&p300bt::cmd_init())?,
+        }
 
         // Request and read status
         self.get_status()?;
@@ -171,6 +182,9 @@ impl<T: Transport> PrinterSession<T> {
     /// between attempts.
     /// Updates internal status and tape width fields.
     pub fn get_status(&mut self) -> Result<&PrinterStatus> {
+        if self.profile.dialect == Dialect::P300Bt {
+            return self.get_p300bt_status();
+        }
         self.send(&protocol::cmd_status_request())?;
 
         let mut buf = [0u8; STATUS_PACKET_SIZE];
@@ -181,7 +195,7 @@ impl<T: Transport> PrinterSession<T> {
         for attempt in 0..STATUS_MAX_RETRIES {
             std::thread::sleep(STATUS_RETRY_DELAY);
 
-            match self.receive_with_timeout(&mut buf, USB_TIMEOUT) {
+            match self.receive_with_timeout(&mut buf, TRANSFER_TIMEOUT) {
                 Ok(0) => {
                     debug!("Empty status read (attempt {})", attempt + 1);
                     continue;
@@ -240,8 +254,7 @@ impl<T: Transport> PrinterSession<T> {
 
         // Resolve tape width to pixel count for this printer's resolution,
         // clamped to the head width (wide tapes exceed narrow heads).
-        self.tape_width_px = tape::tape_pixels(status.media_width, self.profile.dpi)
-            .map(|px| px.min(self.profile.max_px));
+        self.tape_width_px = self.profile.tape_width_px(status.media_width);
         if self.tape_width_px.is_none() && status.media_width != 0 {
             warn!("Unknown tape width: {} mm", status.media_width);
         }
@@ -287,6 +300,18 @@ impl<T: Transport> PrinterSession<T> {
             ));
         }
 
+        if self.profile.dialect == Dialect::P300Bt {
+            let status = self.status.as_ref().ok_or(PtouchError::NotInitialized)?;
+            let job = p300bt::build_print_job(lines, status, chain_print)?;
+            let result = self
+                .send_job(job)
+                .and_then(|_| self.receive_p300bt_completion());
+            if result.is_err() {
+                self.initialized = false;
+            }
+            return result;
+        }
+
         let opts = protocol::JobOptions {
             media_width: self.status.as_ref().map_or(0, |s| s.media_width),
             chain_print,
@@ -314,12 +339,17 @@ impl<T: Transport> PrinterSession<T> {
     /// ejects and cuts. The printer needs actual raster data to engage
     /// the feed mechanism.
     pub fn feed_and_cut(&mut self) -> Result<()> {
+        if self.profile.dialect == Dialect::P300Bt {
+            return Err(PtouchError::UnsupportedOperation(
+                "PT-P300BT has a manual cutter",
+            ));
+        }
         if !self.initialized {
             return Err(PtouchError::NotInitialized);
         }
 
         // One blank line makes the printer engage the feed mechanism.
-        let lines = vec![protocol::rasterline_blank(self.profile.max_px)];
+        let lines = vec![protocol::rasterline_blank(self.profile.raster_width_px)];
         let opts = protocol::JobOptions {
             media_width: self.status.as_ref().map_or(0, |s| s.media_width),
             ..protocol::JobOptions::default()
@@ -391,10 +421,82 @@ impl<T: Transport> PrinterSession<T> {
         Ok(())
     }
 
+    fn get_p300bt_status(&mut self) -> Result<&PrinterStatus> {
+        self.send(&protocol::cmd_status_request())?;
+        let status = read_p300bt_status(
+            |buf, timeout| self.receive_with_timeout(buf, timeout),
+            Duration::from_secs(10),
+            false,
+        )?;
+        self.tape_width_px = self.profile.tape_width_px(status.media_width);
+        self.status = Some(status);
+        Ok(self.status.as_ref().unwrap())
+    }
+
+    fn receive_p300bt_completion(&mut self) -> Result<()> {
+        // A fixed total deadline; phase changes alone never complete the job.
+        self.status = Some(read_p300bt_status(
+            |buf, timeout| self.receive_with_timeout(buf, timeout),
+            Duration::from_secs(60),
+            true,
+        )?);
+        Ok(())
+    }
+
     pub(crate) fn close(self) -> Result<()> {
         self.transport.close()?;
         info!("Device closed: {}", self.profile.name);
         Ok(())
+    }
+}
+
+fn read_p300bt_status<F>(
+    mut receive: F,
+    timeout: Duration,
+    wait_for_completion: bool,
+) -> Result<PrinterStatus>
+where
+    F: FnMut(&mut [u8], Duration) -> Result<usize>,
+{
+    let start = Instant::now();
+    let mut frames = StatusFrameBuffer::new();
+    loop {
+        while let Some(packet) = frames.pop() {
+            let status = parse_status_packet(&packet, "Invalid PT-P300BT status header")?;
+            if status.brother_code != 0x42
+                || status.series_code != 0x30
+                || status.model_code != 0x72
+            {
+                return Err(PtouchError::StatusError(
+                    "Unexpected PT-P300BT status identity".into(),
+                ));
+            }
+            // Error and power-off checks are shared with the USB readiness loop,
+            // but P300BT completion does not require a later receiving phase.
+            print_status_is_ready(&status)?;
+            if (!wait_for_completion && status.status_type == 0)
+                || (wait_for_completion && status.status_type == 1)
+            {
+                return Ok(status);
+            }
+        }
+        let remaining = timeout
+            .checked_sub(start.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(PtouchError::Timeout)?;
+        // A larger receive buffer deliberately permits coalesced notifications.
+        let mut bytes = [0u8; STATUS_PACKET_SIZE * 4];
+        match receive(&mut bytes, remaining.min(PRINT_STATUS_POLL_TIMEOUT)) {
+            Ok(n) if n > bytes.len() => {
+                return Err(PtouchError::StatusError(
+                    "Transport returned more bytes than the receive buffer".into(),
+                ));
+            }
+            Ok(0) => std::thread::sleep(ZERO_LENGTH_TRANSFER_DELAY),
+            Ok(n) => frames.push(&bytes[..n]),
+            Err(PtouchError::Timeout) => {}
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -566,6 +668,7 @@ mod tests {
 
     struct ScriptedTransport {
         writes: std::cell::RefCell<Vec<Vec<u8>>>,
+        fail_on_write: std::cell::Cell<Option<usize>>,
         reads: std::cell::RefCell<VecDeque<Vec<u8>>>,
         // Prove the session works with a transport that cannot cross threads.
         _owner: std::rc::Rc<()>,
@@ -574,6 +677,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 writes: Default::default(),
+                fail_on_write: Default::default(),
                 reads: Default::default(),
                 _owner: std::rc::Rc::new(()),
             }
@@ -582,8 +686,14 @@ mod tests {
     impl Transport for ScriptedTransport {
         fn send(&self, data: &[u8], _timeout: Duration) -> Result<()> {
             self.writes.borrow_mut().push(data.to_vec());
+            if self.fail_on_write.get() == Some(self.writes.borrow().len()) {
+                return Err(PtouchError::SendFailed("Injected transfer failure".into()));
+            }
             if data == [0x1b, 0x69, 0x53] {
                 let mut packet = status_packet(0, 0);
+                packet[2] = 0x42;
+                packet[3] = 0x30;
+                packet[4] = 0x72;
                 packet[10] = 12;
                 self.reads
                     .borrow_mut()
@@ -608,13 +718,171 @@ mod tests {
         PrinterSession::new(
             ScriptedTransport::new(),
             ModelProfile {
+                dialect: Dialect::Usb,
                 name: "Test USB",
-                max_px: 128,
+                raster_width_px: 128,
                 dpi: 180,
                 flags,
             },
         )
     }
+    fn p300bt_packet(kind: u8, phase: u8) -> [u8; STATUS_PACKET_SIZE] {
+        let mut packet = status_packet(kind, phase);
+        packet[2] = 0x42;
+        packet[3] = 0x30;
+        packet[4] = 0x72;
+        packet[10] = 12;
+        packet
+    }
+    #[test]
+    fn p300bt_profile_keeps_printable_and_raster_widths_separate() {
+        let mut session = PrinterSession::new(ScriptedTransport::new(), ModelProfile::P300BT);
+        session.init().unwrap();
+        assert_eq!(session.raster_width_px(), 128);
+        assert_eq!(session.tape_width_px(), Some(64));
+        assert_eq!(ModelProfile::P300BT.tape_width_px(9), None);
+        let mut reset = vec![0; 64];
+        reset.extend([0x1b, 0x40, 0x1b, 0x69, 0x61, 1]);
+        assert_eq!(
+            *session.transport.writes.borrow(),
+            vec![reset, vec![0x1b, 0x69, 0x53]]
+        );
+        assert!(matches!(
+            session.feed_and_cut(),
+            Err(PtouchError::UnsupportedOperation(_))
+        ));
+    }
+    #[test]
+    fn p300bt_failed_job_stops_sending_and_cannot_be_replayed() {
+        let mut session = PrinterSession::new(ScriptedTransport::new(), ModelProfile::P300BT);
+        session.init().unwrap();
+        session.transport.writes.borrow_mut().clear();
+        session.transport.fail_on_write.set(Some(2));
+        assert!(matches!(
+            session.print_raster(
+                &[vec![0; 16]],
+                false,
+                false,
+                protocol::PrintQuality::Standard
+            ),
+            Err(PtouchError::SendFailed(_))
+        ));
+        assert_eq!(session.transport.writes.borrow().len(), 2);
+        assert!(!session.is_initialized());
+        assert!(matches!(
+            session.print_raster(
+                &[vec![0; 16]],
+                false,
+                false,
+                protocol::PrintQuality::Standard
+            ),
+            Err(PtouchError::NotInitialized)
+        ));
+        assert_eq!(session.transport.writes.borrow().len(), 2);
+    }
+
+    #[test]
+    fn p300bt_completion_handles_fragmented_and_coalesced_notifications() {
+        let printing = p300bt_packet(6, 1);
+        let done = p300bt_packet(1, 1);
+        let mut transfers = VecDeque::from([
+            printing[..7].to_vec(),
+            [printing[7..].as_ref(), done.as_ref()].concat(),
+        ]);
+        let result = read_p300bt_status(
+            |buf, _| {
+                let bytes = transfers.pop_front().ok_or(PtouchError::Timeout)?;
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            },
+            Duration::from_secs(1),
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.status_type, 1);
+        assert_eq!(result.phase_type, 1); // No later receiving phase is required.
+        assert!(transfers.is_empty());
+    }
+    #[test]
+    fn p300bt_errors_override_completion_and_disconnects_propagate() {
+        let mut done = p300bt_packet(1, 1);
+        done[8] = 8;
+        let result = read_p300bt_status(
+            |buf, _| {
+                buf[..32].copy_from_slice(&done);
+                Ok(32)
+            },
+            Duration::from_secs(1),
+            true,
+        );
+        assert!(matches!(result, Err(PtouchError::StatusError(_))));
+        let off = p300bt_packet(4, 0);
+        assert!(
+            read_p300bt_status(
+                |buf, _| {
+                    buf[..32].copy_from_slice(&off);
+                    Ok(32)
+                },
+                Duration::from_secs(1),
+                true
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            read_p300bt_status(
+                |_, _| Err(PtouchError::Bluetooth("Disconnected".into())),
+                Duration::from_secs(1),
+                true
+            ),
+            Err(PtouchError::Bluetooth(_))
+        ));
+    }
+    #[test]
+    fn p300bt_query_skips_stale_notifications_and_checks_identity() {
+        let mut transfers = VecDeque::from([p300bt_packet(1, 1), p300bt_packet(0, 0)]);
+        let status = read_p300bt_status(
+            |buf, _| {
+                let bytes = transfers.pop_front().ok_or(PtouchError::Timeout)?;
+                buf[..32].copy_from_slice(&bytes);
+                Ok(32)
+            },
+            Duration::from_secs(1),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status.status_type, 0);
+        let mut wrong = p300bt_packet(0, 0);
+        wrong[4] = 0;
+        assert!(
+            read_p300bt_status(
+                |buf, _| {
+                    buf[..32].copy_from_slice(&wrong);
+                    Ok(32)
+                },
+                Duration::from_secs(1),
+                false
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn p300bt_phase_changes_do_not_extend_the_completion_deadline() {
+        let packet = p300bt_packet(6, 1);
+        let result = read_p300bt_status(
+            |buf, _| {
+                buf[..32].copy_from_slice(&packet);
+                Ok(32)
+            },
+            Duration::from_millis(2),
+            true,
+        );
+        assert!(matches!(result, Err(PtouchError::Timeout)));
+        assert!(matches!(
+            read_p300bt_status(|_, _| Ok(0), Duration::ZERO, true),
+            Err(PtouchError::Timeout)
+        ));
+    }
+
     #[test]
     fn usb_session_keeps_initialization_sequence_and_tape_resolution() {
         let mut session = usb_session(DeviceFlags::AUTO_STATUS_NOTIFICATION);
