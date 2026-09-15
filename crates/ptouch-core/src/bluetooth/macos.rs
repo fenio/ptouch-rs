@@ -106,10 +106,11 @@ impl NativeTransport {
             let Some(address) = (unsafe { device.addressString() }) else {
                 continue;
             };
-            paired.push((
-                unsafe { device.name() }.to_string(),
-                normalize_address(&address.to_string()),
-            ));
+            let address = normalize_address(&address.to_string());
+            let name = unsafe { device.nameOrAddress() }
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| address.clone());
+            paired.push((name, address));
         }
         paired.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         Ok(paired)
