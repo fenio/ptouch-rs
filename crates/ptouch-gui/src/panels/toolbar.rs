@@ -93,6 +93,7 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                     chain_print,
                     auto_cut,
                     quality: state.print_quality,
+                    target: state.printer_target.clone(),
                 });
                 state.operation_in_progress = true;
                 state.status_message = "Printing...".to_string();
@@ -100,11 +101,14 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
         }
 
         if ui
-            .add_enabled(connected && !busy, egui::Button::new("Feed & Cut"))
+            .add_enabled(
+                connected && !busy && !state.printer_target.is_bluetooth(),
+                egui::Button::new("Feed & Cut"),
+            )
             .clicked()
             && let Some(ref tx) = state.printer_cmd_tx
         {
-            let _ = tx.send(PrinterCommand::FeedAndCut);
+            let _ = tx.send(PrinterCommand::FeedAndCut(state.printer_target.clone()));
             state.operation_in_progress = true;
             state.status_message = "Feeding & cutting...".to_string();
         }

@@ -29,6 +29,9 @@ fn load_window_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(exit_code) = printer_worker::run_bluetooth_helper_from_args() {
+        std::process::exit(exit_code);
+    }
     env_logger::init();
 
     // `with_app_id` sets the Wayland app_id / X11 WM_CLASS so the desktop entry

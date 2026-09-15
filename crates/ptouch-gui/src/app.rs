@@ -120,6 +120,9 @@ impl eframe::App for PtouchApp {
         // Drain all pending responses from the printer worker
         while let Ok(resp) = self.resp_rx.try_recv() {
             match resp {
+                PrinterResponse::BluetoothDevices(devices) => {
+                    self.state.bluetooth_targets = devices;
+                }
                 PrinterResponse::Connected {
                     model_name,
                     media_width,
@@ -127,6 +130,7 @@ impl eframe::App for PtouchApp {
                     max_px,
                     dpi,
                     quality_modes,
+                    tape_width_px,
                 } => {
                     self.state.printer_connected = true;
                     self.state.operation_in_progress = false;
@@ -144,19 +148,17 @@ impl eframe::App for PtouchApp {
                     if media_width > 0 {
                         self.state.tape_width_mm = media_width;
                     }
-                    // Re-derive pixels: the width or the printer dpi may
-                    // have changed. Only re-render when they actually did.
+                    // Use the printer's status-derived printable width. This
+                    // differs from the transfer width on the PT-P300BT.
                     let old_px = self.state.tape_width_px;
-                    self.state.update_tape_pixels();
+                    self.state.tape_width_px = u32::from(tape_width_px);
                     if self.state.tape_width_px != old_px {
                         self.state.mark_dirty();
                     }
                 }
                 PrinterResponse::Disconnected => {
-                    if self.state.printer_connected {
-                        self.state.printer_status = Some("Disconnected".to_string());
-                        self.state.printer_model = None;
-                    }
+                    self.state.printer_status = Some("Disconnected".to_string());
+                    self.state.printer_model = None;
                     self.state.printer_connected = false;
                     self.state.operation_in_progress = false;
                     // Keep printer_max_px, printer_dpi, and quality state:

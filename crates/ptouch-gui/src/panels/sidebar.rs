@@ -30,6 +30,30 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Printer");
     ui.add_space(4.0);
 
+    let old_target = state.printer_target.clone();
+    egui::ComboBox::from_label("Connection")
+        .selected_text(state.printer_target.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut state.printer_target,
+                crate::state::PrinterTarget::Usb,
+                "USB (automatic)",
+            );
+            for target in &state.bluetooth_targets {
+                ui.selectable_value(&mut state.printer_target, target.clone(), target.label());
+            }
+        });
+    if state.printer_target != old_target {
+        state.printer_connected = false;
+        state.printer_model = None;
+        state.printer_status = Some("Connecting...".to_string());
+        state.operation_in_progress = true;
+        state.auto_cut = !state.printer_target.is_bluetooth();
+        if let Some(ref tx) = state.printer_cmd_tx {
+            let _ = tx.send(PrinterCommand::Poll(state.printer_target.clone()));
+        }
+    }
+
     let model_text = state.printer_model.as_deref().unwrap_or("Not connected");
     ui.label(format!("Model: {}", model_text));
 
@@ -42,7 +66,8 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
         .clicked()
         && let Some(ref tx) = state.printer_cmd_tx
     {
-        let _ = tx.send(PrinterCommand::Poll);
+        let _ = tx.send(PrinterCommand::Poll(state.printer_target.clone()));
+        let _ = tx.send(PrinterCommand::DiscoverBluetooth);
         info!("Manual printer refresh requested");
     }
 }
@@ -55,32 +80,39 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
     let tapes = tape::supported_tapes(state.printer_dpi);
     let current_label = format!("{} mm ({} px)", state.tape_width_mm, state.tape_width_px);
 
-    egui::ComboBox::from_label("Width")
-        .selected_text(&current_label)
-        .show_ui(ui, |ui| {
-            for t in tapes {
-                let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
-                if ui
-                    .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
-                    .clicked()
-                {
-                    state.update_tape_pixels();
-                    state.mark_dirty();
-                    info!("Tape changed: {} mm", t.width_mm);
+    ui.add_enabled_ui(!state.printer_target.is_bluetooth(), |ui| {
+        egui::ComboBox::from_label("Width")
+            .selected_text(&current_label)
+            .show_ui(ui, |ui| {
+                for t in tapes {
+                    let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
+                    if ui
+                        .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
+                        .clicked()
+                    {
+                        state.update_tape_pixels();
+                        state.mark_dirty();
+                        info!("Tape changed: {} mm", t.width_mm);
+                    }
                 }
-            }
-        });
+            });
+    });
 }
 
 /// Print options: auto-cut toggle and quality selection.
 fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Print Options");
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let label = if state.auto_cut { "Auto cut" } else { "No cut" };
-        ui.label(label);
-        ui.add(crate::widgets::toggle(&mut state.auto_cut));
+    ui.add_enabled_ui(!state.printer_target.is_bluetooth(), |ui| {
+        ui.horizontal(|ui| {
+            let label = if state.auto_cut { "Auto cut" } else { "No cut" };
+            ui.label(label);
+            ui.add(crate::widgets::toggle(&mut state.auto_cut));
+        })
     });
+    if state.printer_target.is_bluetooth() {
+        ui.label("Manual cutter");
+    }
 
     if state.printer_quality_modes {
         let quality_label = |q: PrintQuality| match q {

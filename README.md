@@ -77,6 +77,11 @@ outside that area are rejected. Printing waits for the printer's completion
 notification, checks errors, and never automatically retries a failed job.
 The PT-P300BT has a manual cutter.
 
+The GUI on macOS also lists paired PT-P300BT printers in its **Connection**
+selector. Select the printer and click **Refresh** to query its tape, then compose
+and print through the normal preview workflow. Bluetooth operations run outside
+the interface process so connecting and printing do not block window updates.
+
 Library users can also open `ptouch_core::BluetoothDevice`, call `init`, prepare
 16-byte raster lines using bottom-to-top dot order, then call `print_raster` and
 `close`. Native objects stay on the main thread and cannot be sent or shared

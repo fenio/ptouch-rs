@@ -10,23 +10,48 @@ use ptouch_render::bitmap::LabelBitmap;
 
 pub use ptouch_render::document::LabelElement;
 
+/// Printer connection selected in the GUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrinterTarget {
+    Usb,
+    Bluetooth { name: String, address: String },
+}
+
+impl PrinterTarget {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Usb => "USB (automatic)".to_string(),
+            Self::Bluetooth { name, address } => format!("{name} ({address})"),
+        }
+    }
+
+    pub fn is_bluetooth(&self) -> bool {
+        matches!(self, Self::Bluetooth { .. })
+    }
+}
+
 /// Commands sent from the UI thread to the printer worker.
 pub enum PrinterCommand {
+    /// Find paired Bluetooth printers supported by this application.
+    DiscoverBluetooth,
     /// Poll for a connected printer (query status only, no init).
-    Poll,
+    Poll(PrinterTarget),
     /// Print raster data.
     Print {
         raster_lines: Vec<Vec<u8>>,
         chain_print: bool,
         auto_cut: bool,
         quality: PrintQuality,
+        target: PrinterTarget,
     },
     /// Feed tape forward and cut.
-    FeedAndCut,
+    FeedAndCut(PrinterTarget),
 }
 
 /// Responses sent from the printer worker back to the UI thread.
 pub enum PrinterResponse {
+    /// Paired PT-P300BT printers found by macOS.
+    BluetoothDevices(Vec<PrinterTarget>),
     /// A printer was found and its status queried.
     Connected {
         model_name: String,
@@ -35,6 +60,7 @@ pub enum PrinterResponse {
         max_px: u16,
         dpi: u16,
         quality_modes: bool,
+        tape_width_px: u16,
     },
     /// No printer found or previously connected printer lost.
     Disconnected,
@@ -90,6 +116,10 @@ pub struct AppState {
     pub auto_cut: bool,
     /// Whether a printer is currently connected (detected by background poll).
     pub printer_connected: bool,
+    /// Target selected for polling and printing.
+    pub printer_target: PrinterTarget,
+    /// Paired PT-P300BT targets discovered on macOS.
+    pub bluetooth_targets: Vec<PrinterTarget>,
     /// Whether a printer operation (print, feed & cut) is in progress.
     pub operation_in_progress: bool,
     /// Maximum printable pixels of the last connected printer (0 initially).
@@ -130,6 +160,8 @@ impl Default for AppState {
             font_search: String::new(),
             auto_cut: true,
             printer_connected: false,
+            printer_target: PrinterTarget::Usb,
+            bluetooth_targets: Vec::new(),
             operation_in_progress: false,
             printer_max_px: 0,
             printer_dpi: 180,
