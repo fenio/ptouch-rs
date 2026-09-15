@@ -11,7 +11,7 @@ use ptouch_render::text::TextRenderer;
 
 use crate::panels;
 use crate::printer_worker;
-use crate::state::{AppState, PrinterResponse};
+use crate::state::{AppState, PrinterEvent, PrinterResponse};
 
 /// The main P-Touch GUI application.
 pub struct PtouchApp {
@@ -20,7 +20,7 @@ pub struct PtouchApp {
     /// Text renderer instance for generating label bitmaps.
     renderer: TextRenderer,
     /// Receiver for responses from the printer worker thread.
-    resp_rx: mpsc::Receiver<PrinterResponse>,
+    resp_rx: mpsc::Receiver<PrinterEvent>,
 }
 
 impl PtouchApp {
@@ -112,14 +112,18 @@ impl PtouchApp {
         self.state.preview_bitmap = result;
         info!("Preview updated");
     }
-}
 
-impl eframe::App for PtouchApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    fn drain_printer_responses(&mut self) {
         // Drain all pending responses from the printer worker
-        while let Ok(resp) = self.resp_rx.try_recv() {
-            match resp {
+        while let Ok(event) = self.resp_rx.try_recv() {
+            if event
+                .target
+                .as_ref()
+                .is_some_and(|target| target != &self.state.printer_target)
+            {
+                continue;
+            }
+            match event.response {
                 PrinterResponse::BluetoothDevices(devices) => {
                     self.state.bluetooth_targets = devices;
                 }
@@ -133,7 +137,7 @@ impl eframe::App for PtouchApp {
                     tape_width_px,
                 } => {
                     self.state.printer_connected = true;
-                    self.state.operation_in_progress = false;
+                    self.state.connecting = false;
                     self.state.printer_max_px = max_px;
                     self.state.printer_dpi = dpi;
                     self.state.printer_quality_modes = quality_modes;
@@ -160,7 +164,7 @@ impl eframe::App for PtouchApp {
                     self.state.printer_status = Some("Disconnected".to_string());
                     self.state.printer_model = None;
                     self.state.printer_connected = false;
-                    self.state.operation_in_progress = false;
+                    self.state.connecting = false;
                     // Keep printer_max_px, printer_dpi, and quality state:
                     // the canvas must not resize on a transient disconnect,
                     // and printing is gated on printer_connected anyway.
@@ -179,6 +183,13 @@ impl eframe::App for PtouchApp {
                 }
             }
         }
+    }
+}
+
+impl eframe::App for PtouchApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.drain_printer_responses();
 
         // Top toolbar
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -249,4 +260,113 @@ fn setup_fallback_fonts(ctx: &egui::Context) {
         data: egui::FontData::from_static(include_bytes!("../assets/fonts/NotoEmoji.ttf")),
         families: lowest_both,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::PrinterTarget;
+
+    fn app(state: AppState) -> (PtouchApp, mpsc::Sender<PrinterEvent>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            PtouchApp {
+                state,
+                renderer: TextRenderer::new(),
+                resp_rx: rx,
+            },
+            tx,
+        )
+    }
+
+    fn usb_status() -> PrinterEvent {
+        PrinterEvent {
+            target: Some(PrinterTarget::Usb),
+            response: PrinterResponse::Connected {
+                model_name: "PT-P700".into(),
+                media_width: 24,
+                media_type: "Laminated tape".into(),
+                max_px: 128,
+                dpi: 180,
+                quality_modes: false,
+                tape_width_px: 128,
+            },
+        }
+    }
+
+    #[test]
+    fn late_usb_poll_does_not_connect_selected_bluetooth_printer() {
+        let (mut app, tx) = app(AppState {
+            printer_target: PrinterTarget::Bluetooth {
+                name: "PT-P300BT".into(),
+                address: "AA:BB:CC:DD:EE:FF".into(),
+            },
+            connecting: true,
+            ..AppState::default()
+        });
+        tx.send(usb_status()).unwrap();
+        app.drain_printer_responses();
+        assert!(!app.state.printer_connected);
+        assert!(app.state.connecting);
+        assert!(app.state.printer_model.is_none());
+        tx.send(PrinterEvent {
+            target: Some(PrinterTarget::Usb),
+            response: PrinterResponse::Disconnected,
+        })
+        .unwrap();
+        app.drain_printer_responses();
+        assert!(app.state.connecting);
+
+        tx.send(PrinterEvent {
+            target: Some(app.state.printer_target.clone()),
+            response: PrinterResponse::Connected {
+                model_name: "PT-P300BT".into(),
+                media_width: 12,
+                media_type: "Laminated tape".into(),
+                max_px: 128,
+                dpi: 180,
+                quality_modes: false,
+                tape_width_px: 64,
+            },
+        })
+        .unwrap();
+        app.drain_printer_responses();
+        assert!(app.state.printer_connected);
+        assert!(!app.state.is_printer_busy());
+        assert_eq!(app.state.tape_width_px, 64);
+    }
+
+    #[test]
+    fn status_reply_does_not_finish_pending_print() {
+        let (mut app, tx) = app(AppState {
+            printer_connected: true,
+            operation_in_progress: true,
+            ..AppState::default()
+        });
+        tx.send(usb_status()).unwrap();
+        app.drain_printer_responses();
+        assert!(app.state.operation_in_progress);
+        assert!(
+            app.state
+                .printer_model
+                .as_ref()
+                .unwrap()
+                .starts_with("PT-P700")
+        );
+        tx.send(PrinterEvent {
+            target: Some(PrinterTarget::Usb),
+            response: PrinterResponse::Disconnected,
+        })
+        .unwrap();
+        app.drain_printer_responses();
+        assert!(!app.state.printer_connected);
+        assert!(app.state.operation_in_progress);
+        tx.send(PrinterEvent {
+            target: Some(PrinterTarget::Usb),
+            response: PrinterResponse::PrintDone,
+        })
+        .unwrap();
+        app.drain_printer_responses();
+        assert!(!app.state.operation_in_progress);
+    }
 }

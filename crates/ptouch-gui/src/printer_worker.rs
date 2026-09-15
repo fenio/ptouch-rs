@@ -15,14 +15,14 @@ use ptouch_core::device::DeviceFlags;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_core::transport::PtouchDevice;
 
-use crate::state::{PrinterCommand, PrinterResponse, PrinterTarget};
+use crate::state::{PrinterCommand, PrinterEvent, PrinterResponse, PrinterTarget};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const HELPER_ARG: &str = "--ptouch-bluetooth-helper";
 
 pub fn printer_worker(
     cmd_rx: mpsc::Receiver<PrinterCommand>,
-    resp_tx: mpsc::Sender<PrinterResponse>,
+    resp_tx: mpsc::Sender<PrinterEvent>,
     ctx: egui::Context,
 ) {
     info!("Printer worker started");
@@ -68,7 +68,7 @@ pub fn printer_worker(
     }
 }
 
-fn discover_bluetooth(resp_tx: &mpsc::Sender<PrinterResponse>, ctx: &egui::Context) {
+fn discover_bluetooth(resp_tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
     #[cfg(target_os = "macos")]
     let devices = run_helper(&["list"], None)
         .map(|output| parse_bluetooth_devices(&output))
@@ -79,11 +79,14 @@ fn discover_bluetooth(resp_tx: &mpsc::Sender<PrinterResponse>, ctx: &egui::Conte
     #[cfg(not(target_os = "macos"))]
     let devices = Vec::new();
 
-    let _ = resp_tx.send(PrinterResponse::BluetoothDevices(devices));
+    let _ = resp_tx.send(PrinterEvent {
+        target: None,
+        response: PrinterResponse::BluetoothDevices(devices),
+    });
     ctx.request_repaint();
 }
 
-fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterResponse>, ctx: &egui::Context) {
+fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
     let response = match target {
         PrinterTarget::Usb => poll_usb(),
         #[cfg(any(target_os = "macos", test))]
@@ -93,7 +96,10 @@ fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterResponse>, ctx: &egu
         error!("Poll failed: {message}");
         PrinterResponse::Disconnected
     });
-    let _ = tx.send(response);
+    let _ = tx.send(PrinterEvent {
+        target: Some(target.clone()),
+        response,
+    });
     ctx.request_repaint();
 }
 
@@ -167,7 +173,7 @@ fn parse_bluetooth_status(output: &str) -> Result<PrinterResponse, String> {
 
 fn do_print(
     target: &PrinterTarget,
-    tx: &mpsc::Sender<PrinterResponse>,
+    tx: &mpsc::Sender<PrinterEvent>,
     ctx: &egui::Context,
     raster_lines: &[Vec<u8>],
     chain_print: bool,
@@ -182,7 +188,10 @@ fn do_print(
     let response = result
         .map(|()| PrinterResponse::PrintDone)
         .unwrap_or_else(PrinterResponse::Error);
-    let _ = tx.send(response);
+    let _ = tx.send(PrinterEvent {
+        target: Some(target.clone()),
+        response,
+    });
     ctx.request_repaint();
 }
 
@@ -215,11 +224,7 @@ fn print_bluetooth(address: &str, raster_lines: &[Vec<u8>]) -> Result<(), String
     }
 }
 
-fn do_feed_and_cut(
-    target: &PrinterTarget,
-    tx: &mpsc::Sender<PrinterResponse>,
-    ctx: &egui::Context,
-) {
+fn do_feed_and_cut(target: &PrinterTarget, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
     let result = match target {
         PrinterTarget::Usb => (|| {
             let mut dev = PtouchDevice::open_first().map_err(|e| format!("Connect error: {e}"))?;
@@ -236,7 +241,10 @@ fn do_feed_and_cut(
     let response = result
         .map(|()| PrinterResponse::FeedAndCutDone)
         .unwrap_or_else(PrinterResponse::Error);
-    let _ = tx.send(response);
+    let _ = tx.send(PrinterEvent {
+        target: Some(target.clone()),
+        response,
+    });
     ctx.request_repaint();
 }
 

@@ -76,8 +76,8 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
 
         // -- Action buttons --
         let connected = state.printer_connected;
-        let busy = state.operation_in_progress;
-        let has_bitmap = state.preview_bitmap.is_some();
+        let busy = state.is_printer_busy();
+        let has_bitmap = state.preview_bitmap.is_some() && !state.needs_rerender;
 
         if ui
             .add_enabled(connected && !busy && has_bitmap, egui::Button::new("Print"))
@@ -195,15 +195,7 @@ fn do_open_layout(state: &mut AppState) {
 
     match LabelDocument::from_toml_str(&text) {
         Ok(document) => {
-            state.tape_width_mm = document.tape_width_mm;
-            state.update_tape_pixels();
-            state.font_name = document.font_name;
-            state.font_margin = document.font_margin;
-            state.overall_flip_h = document.flip_h;
-            state.overall_flip_v = document.flip_v;
-            state.elements = document.elements;
-            state.selected_element = None;
-            state.mark_dirty();
+            apply_layout(state, document);
             state.status_message = format!("Opened {}", path.display());
             info!("Opened layout: {}", path.display());
         }
@@ -212,6 +204,20 @@ fn do_open_layout(state: &mut AppState) {
             error!("Layout parse error: {}", e);
         }
     }
+}
+
+fn apply_layout(state: &mut AppState, document: LabelDocument) {
+    if !state.printer_target.is_bluetooth() {
+        state.tape_width_mm = document.tape_width_mm;
+        state.update_tape_pixels();
+    }
+    state.font_name = document.font_name;
+    state.font_margin = document.font_margin;
+    state.overall_flip_h = document.flip_h;
+    state.overall_flip_v = document.flip_v;
+    state.elements = document.elements;
+    state.selected_element = None;
+    state.mark_dirty();
 }
 
 /// Export the current label preview as an image file.
@@ -249,5 +255,71 @@ fn do_export_image(state: &mut AppState) {
                 error!("Image save error: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::PrinterTarget;
+    use ptouch_render::text::TextRenderer;
+
+    fn layout(tape_width_mm: u8) -> LabelDocument {
+        let document = LabelDocument {
+            version: ptouch_render::document::DOCUMENT_VERSION,
+            tape_width_mm,
+            dpi: 180,
+            font_name: "DejaVuSans".into(),
+            font_margin: 0,
+            flip_h: false,
+            flip_v: false,
+            elements: vec![LabelElement::CutMark],
+        };
+        LabelDocument::from_toml_str(&document.to_toml_string().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn opening_layout_keeps_bluetooth_tape_geometry() {
+        for width in [12, 24] {
+            let mut state = AppState {
+                printer_target: PrinterTarget::Bluetooth {
+                    name: "PT-P300BT".into(),
+                    address: "AA:BB:CC:DD:EE:FF".into(),
+                },
+                printer_connected: true,
+                printer_max_px: 128,
+                tape_width_mm: 12,
+                tape_width_px: 64,
+                ..AppState::default()
+            };
+            apply_layout(&mut state, layout(width));
+            assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 64));
+            let bitmap = ptouch_render::document::render_elements(
+                &state.elements,
+                state.tape_width_px,
+                &state.font_name,
+                state.font_margin,
+                &mut TextRenderer::new(),
+            )
+            .unwrap()
+            .unwrap();
+            let lines = raster::bitmap_to_raster_lines(&bitmap, state.printer_max_px);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| line[..4].iter().chain(&line[12..]).all(|&byte| byte == 0))
+            );
+        }
+    }
+
+    #[test]
+    fn opening_usb_layout_uses_saved_tape_width() {
+        let mut state = AppState {
+            tape_width_mm: 24,
+            tape_width_px: 128,
+            ..AppState::default()
+        };
+        apply_layout(&mut state, layout(12));
+        assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 76));
     }
 }

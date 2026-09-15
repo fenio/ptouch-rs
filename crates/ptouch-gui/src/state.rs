@@ -57,6 +57,12 @@ pub enum PrinterCommand {
     FeedAndCut(PrinterTarget),
 }
 
+/// A worker response and the printer it belongs to. Discovery is global.
+pub struct PrinterEvent {
+    pub target: Option<PrinterTarget>,
+    pub response: PrinterResponse,
+}
+
 /// Responses sent from the printer worker back to the UI thread.
 pub enum PrinterResponse {
     /// Paired PT-P300BT printers found by macOS.
@@ -131,6 +137,8 @@ pub struct AppState {
     pub bluetooth_targets: Vec<PrinterTarget>,
     /// Whether a printer operation (print, feed & cut) is in progress.
     pub operation_in_progress: bool,
+    /// Whether the selected printer's status is being requested.
+    pub connecting: bool,
     /// Maximum printable pixels of the last connected printer (0 initially).
     pub printer_max_px: u16,
     /// Print resolution of the last connected printer (180 initially).
@@ -172,6 +180,7 @@ impl Default for AppState {
             printer_target: PrinterTarget::Usb,
             bluetooth_targets: Vec::new(),
             operation_in_progress: false,
+            connecting: false,
             printer_max_px: 0,
             printer_dpi: 180,
             printer_quality_modes: false,
@@ -182,6 +191,10 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn is_printer_busy(&self) -> bool {
+        self.operation_in_progress || self.connecting
+    }
+
     /// Update the tape width in pixels based on the current tape_width_mm
     /// and the connected printer's resolution.
     pub fn update_tape_pixels(&mut self) {

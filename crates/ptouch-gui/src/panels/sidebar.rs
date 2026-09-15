@@ -31,23 +31,25 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(4.0);
 
     let old_target = state.printer_target.clone();
-    egui::ComboBox::from_label("Connection")
-        .selected_text(state.printer_target.label())
-        .show_ui(ui, |ui| {
-            ui.selectable_value(
-                &mut state.printer_target,
-                crate::state::PrinterTarget::Usb,
-                "USB (automatic)",
-            );
-            for target in &state.bluetooth_targets {
-                ui.selectable_value(&mut state.printer_target, target.clone(), target.label());
-            }
-        });
+    ui.add_enabled_ui(!state.is_printer_busy(), |ui| {
+        egui::ComboBox::from_label("Connection")
+            .selected_text(state.printer_target.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.printer_target,
+                    crate::state::PrinterTarget::Usb,
+                    "USB (automatic)",
+                );
+                for target in &state.bluetooth_targets {
+                    ui.selectable_value(&mut state.printer_target, target.clone(), target.label());
+                }
+            });
+    });
     if state.printer_target != old_target {
         state.printer_connected = false;
         state.printer_model = None;
         state.printer_status = Some("Connecting...".to_string());
-        state.operation_in_progress = true;
+        state.connecting = true;
         state.auto_cut = !state.printer_target.is_bluetooth();
         if let Some(ref tx) = state.printer_cmd_tx {
             let _ = tx.send(PrinterCommand::Poll(state.printer_target.clone()));
@@ -62,10 +64,11 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
     if ui
-        .add_enabled(!state.operation_in_progress, egui::Button::new("Refresh"))
+        .add_enabled(!state.is_printer_busy(), egui::Button::new("Refresh"))
         .clicked()
         && let Some(ref tx) = state.printer_cmd_tx
     {
+        state.connecting = true;
         let _ = tx.send(PrinterCommand::Poll(state.printer_target.clone()));
         let _ = tx.send(PrinterCommand::DiscoverBluetooth);
         info!("Manual printer refresh requested");
