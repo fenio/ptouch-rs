@@ -14,19 +14,28 @@ pub use ptouch_render::document::LabelElement;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrinterTarget {
     Usb,
-    Bluetooth { name: String, address: String },
+    #[cfg(any(target_os = "macos", test))]
+    Bluetooth {
+        name: String,
+        address: String,
+    },
 }
 
 impl PrinterTarget {
     pub fn label(&self) -> String {
         match self {
             Self::Usb => "USB (automatic)".to_string(),
+            #[cfg(any(target_os = "macos", test))]
             Self::Bluetooth { name, address } => format!("{name} ({address})"),
         }
     }
 
     pub fn is_bluetooth(&self) -> bool {
-        matches!(self, Self::Bluetooth { .. })
+        match self {
+            Self::Usb => false,
+            #[cfg(any(target_os = "macos", test))]
+            Self::Bluetooth { .. } => true,
+        }
     }
 }
 

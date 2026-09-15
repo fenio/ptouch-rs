@@ -86,6 +86,7 @@ fn discover_bluetooth(resp_tx: &mpsc::Sender<PrinterResponse>, ctx: &egui::Conte
 fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterResponse>, ctx: &egui::Context) {
     let response = match target {
         PrinterTarget::Usb => poll_usb(),
+        #[cfg(any(target_os = "macos", test))]
         PrinterTarget::Bluetooth { address, .. } => poll_bluetooth(address),
     }
     .unwrap_or_else(|message| {
@@ -119,6 +120,7 @@ fn poll_usb() -> Result<PrinterResponse, String> {
     Ok(response)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn poll_bluetooth(address: &str) -> Result<PrinterResponse, String> {
     #[cfg(target_os = "macos")]
     {
@@ -132,6 +134,7 @@ fn poll_bluetooth(address: &str) -> Result<PrinterResponse, String> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_bluetooth_devices(output: &str) -> Vec<PrinterTarget> {
     output
         .lines()
@@ -145,6 +148,7 @@ fn parse_bluetooth_devices(output: &str) -> Vec<PrinterTarget> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_bluetooth_status(output: &str) -> Result<PrinterResponse, String> {
     let fields: Vec<_> = output.trim_end().split('\t').collect();
     if fields.len() != 6 {
@@ -172,6 +176,7 @@ fn do_print(
 ) {
     let result = match target {
         PrinterTarget::Usb => print_usb(raster_lines, chain_print, auto_cut, quality),
+        #[cfg(any(target_os = "macos", test))]
         PrinterTarget::Bluetooth { address, .. } => print_bluetooth(address, raster_lines),
     };
     let response = result
@@ -196,6 +201,7 @@ fn print_usb(
     result
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn print_bluetooth(address: &str, raster_lines: &[Vec<u8>]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -224,6 +230,7 @@ fn do_feed_and_cut(
             let _ = dev.close();
             result
         })(),
+        #[cfg(any(target_os = "macos", test))]
         PrinterTarget::Bluetooth { .. } => Err("PT-P300BT has a manual cutter".to_string()),
     };
     let response = result
