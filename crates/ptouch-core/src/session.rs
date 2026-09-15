@@ -57,6 +57,7 @@ const ZERO_LENGTH_TRANSFER_DELAY: Duration = Duration::from_millis(10);
 pub(crate) struct PrinterSession<T: Transport> {
     pub(crate) transport: T,
     profile: ModelProfile,
+    status_frames: StatusFrameBuffer,
     status: Option<PrinterStatus>,
     tape_width_px: Option<u16>,
     initialized: bool,
@@ -67,6 +68,7 @@ impl<T: Transport> PrinterSession<T> {
         Self {
             transport,
             profile,
+            status_frames: StatusFrameBuffer::new(),
             status: None,
             tape_width_px: None,
             initialized: false,
@@ -423,8 +425,10 @@ impl<T: Transport> PrinterSession<T> {
 
     fn get_p300bt_status(&mut self) -> Result<&PrinterStatus> {
         self.send(&protocol::cmd_status_request())?;
+        let transport = &self.transport;
         let status = read_p300bt_status(
-            |buf, timeout| self.receive_with_timeout(buf, timeout),
+            &mut self.status_frames,
+            |buf, timeout| transport.receive(buf, timeout),
             Duration::from_secs(10),
             false,
         )?;
@@ -435,8 +439,10 @@ impl<T: Transport> PrinterSession<T> {
 
     fn receive_p300bt_completion(&mut self) -> Result<()> {
         // A fixed total deadline; phase changes alone never complete the job.
+        let transport = &self.transport;
         self.status = Some(read_p300bt_status(
-            |buf, timeout| self.receive_with_timeout(buf, timeout),
+            &mut self.status_frames,
+            |buf, timeout| transport.receive(buf, timeout),
             Duration::from_secs(60),
             true,
         )?);
@@ -451,6 +457,7 @@ impl<T: Transport> PrinterSession<T> {
 }
 
 fn read_p300bt_status<F>(
+    frames: &mut StatusFrameBuffer,
     mut receive: F,
     timeout: Duration,
     wait_for_completion: bool,
@@ -459,7 +466,6 @@ where
     F: FnMut(&mut [u8], Duration) -> Result<usize>,
 {
     let start = Instant::now();
-    let mut frames = StatusFrameBuffer::new();
     loop {
         while let Some(packet) = frames.pop() {
             let status = parse_status_packet(&packet, "Invalid PT-P300BT status header")?;
@@ -790,6 +796,7 @@ mod tests {
             [printing[7..].as_ref(), done.as_ref()].concat(),
         ]);
         let result = read_p300bt_status(
+            &mut StatusFrameBuffer::new(),
             |buf, _| {
                 let bytes = transfers.pop_front().ok_or(PtouchError::Timeout)?;
                 buf[..bytes.len()].copy_from_slice(&bytes);
@@ -808,6 +815,7 @@ mod tests {
         let mut done = p300bt_packet(1, 1);
         done[8] = 8;
         let result = read_p300bt_status(
+            &mut StatusFrameBuffer::new(),
             |buf, _| {
                 buf[..32].copy_from_slice(&done);
                 Ok(32)
@@ -819,6 +827,7 @@ mod tests {
         let off = p300bt_packet(4, 0);
         assert!(
             read_p300bt_status(
+                &mut StatusFrameBuffer::new(),
                 |buf, _| {
                     buf[..32].copy_from_slice(&off);
                     Ok(32)
@@ -830,6 +839,7 @@ mod tests {
         );
         assert!(matches!(
             read_p300bt_status(
+                &mut StatusFrameBuffer::new(),
                 |_, _| Err(PtouchError::Bluetooth("Disconnected".into())),
                 Duration::from_secs(1),
                 true
@@ -841,6 +851,7 @@ mod tests {
     fn p300bt_query_skips_stale_notifications_and_checks_identity() {
         let mut transfers = VecDeque::from([p300bt_packet(1, 1), p300bt_packet(0, 0)]);
         let status = read_p300bt_status(
+            &mut StatusFrameBuffer::new(),
             |buf, _| {
                 let bytes = transfers.pop_front().ok_or(PtouchError::Timeout)?;
                 buf[..32].copy_from_slice(&bytes);
@@ -855,6 +866,7 @@ mod tests {
         wrong[4] = 0;
         assert!(
             read_p300bt_status(
+                &mut StatusFrameBuffer::new(),
                 |buf, _| {
                     buf[..32].copy_from_slice(&wrong);
                     Ok(32)
@@ -869,6 +881,7 @@ mod tests {
     fn p300bt_phase_changes_do_not_extend_the_completion_deadline() {
         let packet = p300bt_packet(6, 1);
         let result = read_p300bt_status(
+            &mut StatusFrameBuffer::new(),
             |buf, _| {
                 buf[..32].copy_from_slice(&packet);
                 Ok(32)
@@ -878,7 +891,12 @@ mod tests {
         );
         assert!(matches!(result, Err(PtouchError::Timeout)));
         assert!(matches!(
-            read_p300bt_status(|_, _| Ok(0), Duration::ZERO, true),
+            read_p300bt_status(
+                &mut StatusFrameBuffer::new(),
+                |_, _| Ok(0),
+                Duration::ZERO,
+                true
+            ),
             Err(PtouchError::Timeout)
         ));
     }
@@ -1165,5 +1183,42 @@ mod tests {
             "zero-length transfers were not paced ({} reads)",
             transfers
         );
+    }
+
+    #[test]
+    fn p300bt_status_stream_preserves_error_notifications_across_calls() {
+        fn packet(kind: u8, error: u8) -> Vec<u8> {
+            let mut bytes = p300bt_packet(kind, 0).to_vec();
+            bytes[8] = error;
+            bytes
+        }
+
+        for limit in [7, 32, 64] {
+            let mut stream: VecDeque<u8> =
+                [packet(0, 0), packet(2, 8), packet(1, 0)].concat().into();
+            let mut receive = |buf: &mut [u8], _: Duration| {
+                if stream.is_empty() {
+                    return Err(PtouchError::Timeout);
+                }
+                let count = stream.len().min(buf.len()).min(limit);
+                for byte in &mut buf[..count] {
+                    *byte = stream.pop_front().unwrap();
+                }
+                Ok(count)
+            };
+            let mut frames = StatusFrameBuffer::new();
+
+            let result =
+                read_p300bt_status(&mut frames, &mut receive, Duration::from_secs(1), false)
+                    .and_then(|_| {
+                        read_p300bt_status(&mut frames, &mut receive, Duration::from_secs(1), true)
+                    })
+                    .map(|_| ());
+
+            assert!(
+                matches!(result, Err(PtouchError::StatusError(ref message)) if message == "Weak battery"),
+                "lost error at read limit {limit}: {result:?}"
+            );
+        }
     }
 }
