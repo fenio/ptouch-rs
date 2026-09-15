@@ -16,6 +16,9 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use log::debug;
 
+#[cfg(target_os = "macos")]
+use ptouch_core::BluetoothDevice;
+use ptouch_core::PrinterStatus;
 use ptouch_core::device::{self, DeviceFlags, DeviceInfo};
 use ptouch_core::error::PtouchError;
 use ptouch_core::protocol::PrintQuality;
@@ -50,12 +53,18 @@ enum Commands {
     Info(InfoArgs),
     /// List supported printer models
     List,
+    /// List devices paired in macOS Bluetooth settings
+    BluetoothList,
     /// Launch GUI mode
     Gui,
 }
 
 #[derive(clap::Args)]
 struct PrintArgs {
+    /// Use an already-paired PT-P300BT at this Bluetooth address (macOS only)
+    #[arg(long, value_name = "ADDRESS")]
+    bluetooth: Option<String>,
+
     /// Text lines to print (each argument = one line, max 4)
     #[arg(value_name = "TEXT")]
     text: Vec<String>,
@@ -160,6 +169,10 @@ struct PrintArgs {
 
 #[derive(clap::Args)]
 struct InfoArgs {
+    /// Use an already-paired PT-P300BT at this Bluetooth address (macOS only)
+    #[arg(long, value_name = "ADDRESS")]
+    bluetooth: Option<String>,
+
     /// Enable debug output
     #[arg(long)]
     debug: bool,
@@ -167,6 +180,110 @@ struct InfoArgs {
     /// Printer timeout in seconds
     #[arg(long, default_value = "1")]
     timeout: u32,
+}
+
+/// The printer selected by the CLI. USB remains the default target.
+enum CliDevice {
+    Usb(PtouchDevice),
+    #[cfg(target_os = "macos")]
+    Bluetooth(BluetoothDevice),
+}
+
+impl CliDevice {
+    fn open(bluetooth: Option<&str>) -> Result<Self, PtouchError> {
+        if let Some(address) = bluetooth {
+            #[cfg(target_os = "macos")]
+            {
+                return BluetoothDevice::open(address).map(Self::Bluetooth);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = address;
+                return Err(PtouchError::UnsupportedOperation(
+                    "--bluetooth is available on macOS only",
+                ));
+            }
+        }
+        PtouchDevice::open_first().map(Self::Usb)
+    }
+
+    fn init(&mut self) -> Result<(), PtouchError> {
+        match self {
+            Self::Usb(device) => device.init(),
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.init(),
+        }
+    }
+
+    fn status(&self) -> Option<&PrinterStatus> {
+        match self {
+            Self::Usb(device) => device.status(),
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.status(),
+        }
+    }
+
+    fn model_name(&self) -> &'static str {
+        match self {
+            Self::Usb(device) => device.device_info().name,
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.model_name(),
+        }
+    }
+
+    fn dpi(&self) -> u16 {
+        match self {
+            Self::Usb(device) => device.device_info().dpi,
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.dpi(),
+        }
+    }
+
+    fn tape_width_px(&self) -> Option<u16> {
+        match self {
+            Self::Usb(device) => device.tape_width_px(),
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.tape_width_px(),
+        }
+    }
+
+    fn raster_width_px(&self) -> u16 {
+        match self {
+            Self::Usb(device) => device.max_px(),
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.raster_width_px(),
+        }
+    }
+
+    fn is_bluetooth(&self) -> bool {
+        match self {
+            Self::Usb(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(_) => true,
+        }
+    }
+
+    fn print_raster(
+        &mut self,
+        lines: &[Vec<u8>],
+        chain_print: bool,
+        precut: bool,
+        quality: PrintQuality,
+    ) -> Result<(), PtouchError> {
+        match self {
+            Self::Usb(device) => device.print_raster(lines, chain_print, precut, quality),
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.print_raster(lines),
+        }
+    }
+
+    fn close(self) -> Result<(), PtouchError> {
+        match self {
+            Self::Usb(device) => device.close(),
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.close(),
+        }
+    }
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -186,7 +303,7 @@ impl AlignArg {
     }
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum QualityArg {
     Standard,
     High,
@@ -233,6 +350,12 @@ fn main() {
 
     match cli.command {
         Commands::List => execute_list(),
+        Commands::BluetoothList => {
+            if let Err(e) = execute_bluetooth_list() {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        }
         Commands::Gui => execute_gui(),
         Commands::Info(args) => {
             init_logging(args.debug);
@@ -370,6 +493,29 @@ fn execute_list() {
     }
 }
 
+/// List paired devices and the stable addresses accepted by `--bluetooth`.
+fn execute_bluetooth_list() -> Result<(), PtouchError> {
+    #[cfg(target_os = "macos")]
+    {
+        let devices = BluetoothDevice::paired_devices()?;
+        if devices.is_empty() {
+            println!("No paired Bluetooth devices found.");
+        } else {
+            println!("Paired Bluetooth devices:");
+            for device in devices {
+                println!("  {}  {}", device.address, device.name);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(PtouchError::UnsupportedOperation(
+            "bluetooth-list is available on macOS only",
+        ))
+    }
+}
+
 /// Format device flags into a human-readable string.
 fn format_flags(dev: &DeviceInfo) -> String {
     let mut parts = Vec::new();
@@ -421,8 +567,8 @@ fn execute_gui() {
 // ---------------------------------------------------------------------------
 
 /// Open the printer and display status and tape information.
-fn execute_info(_args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut dev = PtouchDevice::open_first()?;
+fn execute_info(args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut dev = CliDevice::open(args.bluetooth.as_deref())?;
     dev.init()?;
 
     // init() already called get_status() internally; use that result.
@@ -432,7 +578,7 @@ fn execute_info(_args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         .clone();
 
     println!("Printer Information");
-    println!("  Model:          {}", dev.device_info().name);
+    println!("  Model:          {}", dev.model_name());
     println!("  Status:         {}", status.status_type_name());
     println!("  Media type:     {}", status.media_type_name());
     println!("  Media width:    {} mm", status.media_width);
@@ -444,8 +590,8 @@ fn execute_info(_args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let tape_width_px = dev.tape_width_px();
-    let max_px = dev.max_px();
-    let dpi = dev.device_info().dpi;
+    let max_px = dev.raster_width_px();
+    let dpi = dev.dpi();
 
     println!();
     println!("Tape Details");
@@ -454,13 +600,19 @@ fn execute_info(_args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("  Tape width:     unknown");
     }
-    println!("  Max printable:  {} px", max_px);
+    if dev.is_bluetooth() {
+        println!("  Raster width:   {} px", max_px);
+    } else {
+        println!("  Max printable:  {} px", max_px);
+    }
     println!("  Resolution:     {} DPI", dpi);
 
     // Look up tape info by the reported media width. The pixel value from
     // the transport is clamped to the head width, so it cannot be used as
     // a reverse lookup key.
-    if let Some(t) = tape::find_tape(status.media_width, dpi) {
+    if !dev.is_bluetooth()
+        && let Some(t) = tape::find_tape(status.media_width, dpi)
+    {
         println!("  Tape size:      {} mm", t.width_mm);
         println!("  Margin:         {:.1} mm", t.margin_mm);
     }
@@ -488,6 +640,8 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
         process::exit(1);
     }
 
+    validate_bluetooth_print_options(args)?;
+
     if let Some(layout_path) = args.layout.as_deref() {
         if !ignored.is_empty() {
             eprintln!("WARN: --layout is set; ignoring: {}", ignored.join(", "));
@@ -512,7 +666,7 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
     }
 
     // Determine the print width and optionally open the device
-    let (print_width, max_px, mut device): (u32, u16, Option<PtouchDevice>) =
+    let (print_width, max_px, mut device): (u32, u16, Option<CliDevice>) =
         if let Some(w) = args.tape_width {
             // PNG-only mode, no printer needed
             debug!("PNG-only mode with forced tape width: {} px", w);
@@ -520,13 +674,13 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
         } else {
             // Connect to the printer
             debug!("Connecting to printer...");
-            let mut dev = PtouchDevice::open_first()?;
+            let mut dev = CliDevice::open(args.bluetooth.as_deref())?;
             dev.init()?;
             // init() already called get_status() internally
             let width = dev.tape_width_px().ok_or_else(|| {
                 PtouchError::StatusError("Could not determine tape width".to_string())
             })?;
-            let max = dev.max_px();
+            let max = dev.raster_width_px();
             debug!("Printer tape width: {} px, max: {} px", width, max);
             (u32::from(width), max, Some(dev))
         };
@@ -539,6 +693,30 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
         dev.close()?;
     }
 
+    Ok(())
+}
+
+/// Reject combinations that the physically verified PT-P300BT path does not
+/// implement. Do this before opening the printer or rendering the label.
+fn validate_bluetooth_print_options(args: &PrintArgs) -> Result<(), PtouchError> {
+    if args.bluetooth.is_none() {
+        return Ok(());
+    }
+    if args.chain {
+        return Err(PtouchError::UnsupportedOperation(
+            "--chain is not supported by PT-P300BT",
+        ));
+    }
+    if args.precut {
+        return Err(PtouchError::UnsupportedOperation(
+            "--precut is not supported by PT-P300BT, which has a manual cutter",
+        ));
+    }
+    if args.quality != QualityArg::Standard {
+        return Err(PtouchError::UnsupportedOperation(
+            "PT-P300BT supports standard print quality only",
+        ));
+    }
     Ok(())
 }
 
@@ -679,7 +857,7 @@ fn render_layout(
 fn resolve_layout_target(
     args: &PrintArgs,
     doc: &LabelDocument,
-) -> Result<(u32, u16, Option<PtouchDevice>), Box<dyn std::error::Error>> {
+) -> Result<(u32, u16, Option<CliDevice>), Box<dyn std::error::Error>> {
     // Offline export renders at the resolution the layout was designed at;
     // printing uses the printer's own status-derived width.
     let saved_px = tape::find_tape(doc.tape_width_mm, doc.dpi).map(|t| u32::from(t.pixels));
@@ -696,7 +874,7 @@ fn resolve_layout_target(
         })?;
         Ok((w, w as u16, None))
     } else {
-        let mut dev = PtouchDevice::open_first()?;
+        let mut dev = CliDevice::open(args.bluetooth.as_deref())?;
         dev.init()?;
         let printer_px = u32::from(dev.tape_width_px().ok_or_else(|| {
             PtouchError::StatusError("Could not determine tape width".to_string())
@@ -716,7 +894,7 @@ fn resolve_layout_target(
                 doc.tape_width_mm
             );
         }
-        let max = dev.max_px();
+        let max = dev.raster_width_px();
         Ok((printer_px, max, Some(dev)))
     }
 }
@@ -726,11 +904,11 @@ fn emit_label(
     bitmap: &LabelBitmap,
     args: &PrintArgs,
     max_px: u16,
-    device: Option<&mut PtouchDevice>,
+    device: Option<&mut CliDevice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref output_path) = args.output {
         bitmap.save(Path::new(output_path))?;
-        let dpi = device.as_ref().map_or(180, |d| d.device_info().dpi);
+        let dpi = device.as_ref().map_or(180, |d| d.dpi());
         let tape_mm = bitmap.width() as f64 / f64::from(dpi) * 25.4;
         println!(
             "Saved to '{}' ({}x{} px, {:.1} mm of tape)",
@@ -845,7 +1023,7 @@ fn make_padding(print_width: u32, pad_px: u32) -> LabelBitmap {
 
 /// Send the label bitmap to the printer.
 fn print_to_device(
-    dev: &mut PtouchDevice,
+    dev: &mut CliDevice,
     bitmap: &LabelBitmap,
     max_px: u16,
     args: &PrintArgs,
@@ -858,7 +1036,7 @@ fn print_to_device(
         // Chain intermediate copies (no cut between copies).
         // Last copy: chain only if user requested --chain.
         // Chain intermediate copies; last copy follows user's --chain flag
-        let chain_print = args.chain || !is_last;
+        let chain_print = !dev.is_bluetooth() && (args.chain || !is_last);
 
         debug!(
             "Printing copy {}/{} ({} raster lines, chain={})",
@@ -876,7 +1054,7 @@ fn print_to_device(
         )?;
     }
 
-    let tape_mm = bitmap.width() as f64 / f64::from(dev.device_info().dpi) * 25.4;
+    let tape_mm = bitmap.width() as f64 / f64::from(dev.dpi()) * 25.4;
     println!(
         "Printed {} cop{} ({:.1} mm of tape each)",
         total_copies,
@@ -893,6 +1071,62 @@ mod tests {
 
     fn print_matches(argv: &[&str]) -> ArgMatches {
         Cli::command().get_matches_from(argv)
+    }
+
+    #[test]
+    fn bluetooth_target_is_accepted_by_info_and_print() {
+        let info =
+            Cli::try_parse_from(["ptouch", "info", "--bluetooth", "AA:BB:CC:DD:EE:FF"]).unwrap();
+        let Commands::Info(info) = info.command else {
+            panic!("expected info command");
+        };
+        assert_eq!(info.bluetooth.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+
+        let print = Cli::try_parse_from([
+            "ptouch",
+            "print",
+            "--bluetooth",
+            "AA:BB:CC:DD:EE:FF",
+            "Hello",
+        ])
+        .unwrap();
+        let Commands::Print(print) = print.command else {
+            panic!("expected print command");
+        };
+        assert_eq!(print.bluetooth.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(print.text, ["Hello"]);
+        assert!(validate_bluetooth_print_options(&print).is_ok());
+    }
+
+    #[test]
+    fn bluetooth_list_command_is_accepted() {
+        let cli = Cli::try_parse_from(["ptouch", "bluetooth-list"]).unwrap();
+        assert!(matches!(cli.command, Commands::BluetoothList));
+    }
+
+    #[test]
+    fn bluetooth_rejects_unimplemented_print_options_before_connecting() {
+        for option in ["--chain", "--precut", "--quality=high"] {
+            let cli = Cli::try_parse_from([
+                "ptouch",
+                "print",
+                "--bluetooth",
+                "AA:BB:CC:DD:EE:FF",
+                option,
+                "Hello",
+            ])
+            .unwrap();
+            let Commands::Print(print) = cli.command else {
+                panic!("expected print command");
+            };
+            assert!(
+                matches!(
+                    validate_bluetooth_print_options(&print),
+                    Err(PtouchError::UnsupportedOperation(_))
+                ),
+                "option was unexpectedly accepted: {option}"
+            );
+        }
     }
 
     #[test]

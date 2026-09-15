@@ -54,20 +54,22 @@ external libusb dependency.
 
 ## PT-P300BT Bluetooth (macOS)
 
-The optional `ptouch-core` `bluetooth` feature adds a native RFCOMM backend and
-an example entry point. Pair the printer in macOS Bluetooth settings and grant
-Bluetooth access to the terminal/application. The existing CLI and GUI currently
-continue to select USB printers.
+The macOS CLI can use the native RFCOMM backend for an already-paired PT-P300BT.
+Pair the printer in macOS Bluetooth settings and grant Bluetooth access to the
+terminal. Without `--bluetooth`, the CLI continues to select USB printers.
 
 ```sh
-CARGO_HOME=/tmp/ptouch-bt-cargo cargo run -p ptouch-core --features bluetooth --example bluetooth -- status AA:BB:CC:DD:EE:FF 3
-CARGO_HOME=/tmp/ptouch-bt-cargo cargo run -p ptouch-core --features bluetooth --example bluetooth -- print AA:BB:CC:DD:EE:FF
+CARGO_HOME=/tmp/ptouch-bt-cargo cargo run -p ptouch-cli -- bluetooth-list
+CARGO_HOME=/tmp/ptouch-bt-cargo cargo run -p ptouch-cli -- info --bluetooth AA:BB:CC:DD:EE:FF
+CARGO_HOME=/tmp/ptouch-bt-cargo cargo run -p ptouch-cli -- print --bluetooth AA:BB:CC:DD:EE:FF "Hello"
 ```
 
-Replace the address with your paired printer's address. `status` repeats three
-connection/query/close sessions; `print` sends one fixed RUST label. Cargo
-artifacts stay in the checkout and dependencies in the specified temporary
-cache. No Python packages or Bluetooth serial device nodes are required.
+Replace the address with your paired printer's address. Text, images, saved
+layouts, CSV batches, and multiple copies use the normal CLI rendering flow.
+PT-P300BT rejects `--chain`, `--precut`, and non-standard quality modes before
+connecting. Cargo artifacts stay in the checkout and dependencies in the
+specified temporary cache. No Python packages or Bluetooth serial device nodes
+are required.
 
 The first profile supports the physically verified 12mm tape, with 64 printable
 dots centered in 128-dot raster transfer lines at 180 dpi. Other widths and marks
@@ -75,7 +77,7 @@ outside that area are rejected. Printing waits for the printer's completion
 notification, checks errors, and never automatically retries a failed job.
 The PT-P300BT has a manual cutter.
 
-Library users can open `ptouch_core::BluetoothDevice`, call `init`, prepare
+Library users can also open `ptouch_core::BluetoothDevice`, call `init`, prepare
 16-byte raster lines using bottom-to-top dot order, then call `print_raster` and
 `close`. Native objects stay on the main thread and cannot be sent or shared
 across threads. These synchronous session calls are suitable for the example;

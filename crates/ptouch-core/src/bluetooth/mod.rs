@@ -39,7 +39,31 @@ pub struct BluetoothDevice {
     session: PrinterSession<NativeTransport>,
 }
 
+/// A device already paired in macOS Bluetooth settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedBluetoothDevice {
+    /// Display name reported by the device.
+    pub name: String,
+    /// Stable colon-separated Bluetooth address accepted by
+    /// [`BluetoothDevice::open`].
+    pub address: String,
+}
+
 impl BluetoothDevice {
+    /// List devices already paired in macOS Bluetooth settings.
+    ///
+    /// This identifies explicit addresses for [`Self::open`]; it does not
+    /// connect to the devices or claim that every listed model is supported.
+    /// Must be called on the main thread.
+    pub fn paired_devices() -> Result<Vec<PairedBluetoothDevice>> {
+        NativeTransport::paired_devices().map(|devices| {
+            devices
+                .into_iter()
+                .map(|(name, address)| PairedBluetoothDevice { name, address })
+                .collect()
+        })
+    }
+
     /// Open an already-paired printer by its colon-separated Bluetooth address.
     ///
     /// Must be called on the main thread. Call [`Self::init`] before printing.

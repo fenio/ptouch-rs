@@ -91,6 +91,30 @@ pub(crate) struct NativeTransport {
     closed: Cell<bool>,
 }
 impl NativeTransport {
+    pub(crate) fn paired_devices() -> Result<Vec<(String, String)>> {
+        let _main = MainThreadMarker::new()
+            .ok_or_else(|| bt("Native Bluetooth must be queried on the main thread"))?;
+        let Some(devices) = (unsafe { IOBluetoothDevice::pairedDevices() }) else {
+            return Ok(Vec::new());
+        };
+        let mut paired = Vec::new();
+        for index in 0..devices.len() {
+            let object = devices.objectAtIndex(index);
+            let Some(device) = object.downcast_ref::<IOBluetoothDevice>() else {
+                continue;
+            };
+            let Some(address) = (unsafe { device.addressString() }) else {
+                continue;
+            };
+            paired.push((
+                unsafe { device.name() }.to_string(),
+                normalize_address(&address.to_string()),
+            ));
+        }
+        paired.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        Ok(paired)
+    }
+
     pub(crate) fn open(address: &str) -> Result<Self> {
         let _main = MainThreadMarker::new()
             .ok_or_else(|| bt("Native Bluetooth must be opened and used on the main thread"))?;
@@ -263,6 +287,10 @@ impl NativeTransport {
         Ok(())
     }
 }
+
+fn normalize_address(address: &str) -> String {
+    address.replace('-', ":").to_ascii_uppercase()
+}
 impl Drop for NativeTransport {
     fn drop(&mut self) {
         let _ = self.shutdown();
@@ -288,6 +316,12 @@ impl Transport for NativeTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_macos_addresses_for_cli_input() {
+        assert_eq!(normalize_address("ec-79-49-61-cc-f8"), "EC:79:49:61:CC:F8");
+    }
+
     #[test]
     fn rejects_worker_thread_before_accessing_bluetooth() {
         let rejected = std::thread::spawn(|| match NativeTransport::open("AA:BB:CC:DD:EE:FF") {
