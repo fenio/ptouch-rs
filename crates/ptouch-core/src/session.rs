@@ -112,7 +112,9 @@ impl<T: Transport> PrinterSession<T> {
         self.transport.receive(buf, timeout)
     }
 
-    fn flush_input(&self) {
+    fn flush_input(&mut self) {
+        // Discard cached prefixes together with their unread tails in the transport.
+        self.status_frames.clear();
         let mut buf = [0u8; 64];
         let start = Instant::now();
         loop {
@@ -605,6 +607,10 @@ impl StatusFrameBuffer {
 
     fn push(&mut self, bytes: &[u8]) {
         self.pending.extend_from_slice(bytes);
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
     }
 
     fn len(&self) -> usize {
@@ -1219,6 +1225,67 @@ mod tests {
                 matches!(result, Err(PtouchError::StatusError(ref message)) if message == "Weak battery"),
                 "lost error at read limit {limit}: {result:?}"
             );
+        }
+    }
+
+    fn p300bt_session_after_print(notification_prefix: usize) -> PrinterSession<ScriptedTransport> {
+        let mut session = PrinterSession::new(ScriptedTransport::new(), ModelProfile::P300BT);
+        session.init().unwrap();
+
+        let completed = p300bt_packet(1, 1);
+        let receiving = p300bt_packet(6, 0);
+        // A read can include completion and the start of the next notification.
+        // Its remaining bytes stay in the transport until the next operation.
+        session
+            .transport
+            .reads
+            .borrow_mut()
+            .push_back([completed.as_ref(), &receiving[..notification_prefix]].concat());
+        if notification_prefix < receiving.len() {
+            session
+                .transport
+                .reads
+                .borrow_mut()
+                .push_back(receiving[notification_prefix..].to_vec());
+        }
+        session
+            .print_raster(
+                &[vec![0; 16]],
+                false,
+                false,
+                protocol::PrintQuality::Standard,
+            )
+            .unwrap();
+        session
+    }
+
+    #[test]
+    fn p300bt_query_after_print_flushes_partial_notifications() {
+        for prefix in 0..=STATUS_PACKET_SIZE {
+            let mut session = p300bt_session_after_print(prefix);
+            let status = session.query_status().unwrap_or_else(|error| {
+                panic!("query failed with {prefix} buffered bytes: {error}")
+            });
+            assert_eq!(status.status_type, 0);
+            assert_eq!(status.media_width, 12);
+            assert!(!status.has_error());
+            assert_eq!(session.tape_width_px(), Some(64));
+        }
+    }
+
+    #[test]
+    fn p300bt_init_after_print_flushes_partial_notifications() {
+        for prefix in 0..=STATUS_PACKET_SIZE {
+            let mut session = p300bt_session_after_print(prefix);
+            session.init().unwrap_or_else(|error| {
+                panic!("init failed with {prefix} buffered bytes: {error}")
+            });
+            let status = session.status().unwrap();
+            assert_eq!(status.status_type, 0);
+            assert_eq!(status.media_width, 12);
+            assert!(!status.has_error());
+            assert_eq!(session.tape_width_px(), Some(64));
+            assert!(session.is_initialized());
         }
     }
 }
